@@ -1,7 +1,6 @@
 use clap::{Parser, Subcommand};
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, Slice};
 use scru128::Scru128Id;
-use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
@@ -85,9 +84,7 @@ impl Store {
     }
 
     fn store_chunk(&self, data: &[u8]) -> fjall::Result<[u8; 32]> {
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        let hash: [u8; 32] = hasher.finalize().into();
+        let hash: [u8; 32] = blake3::hash(data).into();
 
         // Only write if not already present (content-addressed)
         if self.cas.get(hash)?.is_none() {

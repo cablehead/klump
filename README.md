@@ -9,7 +9,7 @@ Storing large blobs requires buffering entire content before write. Can't stream
 ## Approach
 
 - Split incoming bytes into 64KB chunks
-- Store chunks by SHA-256 hash (content-addressed, deduped)
+- Store chunks by BLAKE3 hash (content-addressed, deduped)
 - Blob ID (scru128) assigned immediately, before content fully ingested
 - Append-only: each chunk write adds one entry, EOF marker signals completion
 
