@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use fjall::{Database, Keyspace, KeyspaceCreateOptions, Slice};
+use fjall::{CompressionType, Database, Keyspace, KeyspaceCreateOptions, KvSeparationOptions, Slice};
 use scru128::Scru128Id;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -53,8 +53,17 @@ fn chunk_key(id: &Scru128Id, seq: u32) -> [u8; 20] {
 impl Store {
     fn open(path: PathBuf) -> fjall::Result<Self> {
         let db = Database::builder(path).open()?;
-        let cas = db.keyspace("cas", || KeyspaceCreateOptions::default())?;
+
+        // CAS: large values (64KB chunks), use KV-separation with LZ4
+        let cas = db.keyspace("cas", || {
+            KeyspaceCreateOptions::default().with_kv_separation(Some(
+                KvSeparationOptions::default().compression(CompressionType::Lz4),
+            ))
+        })?;
+
+        // Blobs: small keys/values (20B -> 32B or empty), defaults fine
         let blobs = db.keyspace("blobs", || KeyspaceCreateOptions::default())?;
+
         Ok(Self { db, cas, blobs })
     }
 
