@@ -1,6 +1,6 @@
 # klump
 
-Chunked blob storage experiment using fjall.
+Chunked blob storage experiment using [fjall](https://github.com/fjall-rs/fjall).
 
 ## Problem
 
