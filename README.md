@@ -11,13 +11,19 @@ Storing large blobs requires buffering entire content before write. Can't stream
 - Split incoming bytes into 64KB chunks
 - Store chunks by SHA-256 hash (content-addressed, deduped)
 - Blob ID (scru128) assigned immediately, before content fully ingested
-- Each chunk write appends one index entry (no manifest rewriting)
+- Append-only: each chunk write adds one entry, EOF marker signals completion
 
 Two keyspaces:
 - `cas`: `hash (32B) → chunk bytes`
-- `blobs`: `blob_id (16B) → meta (9B)` and `blob_id (16B) + seq (4B) → hash (32B)`
+- `blobs`: `blob_id (16B) + seq (4B) → hash (32B)` or `→ empty (EOF)`
 
-Meta: 1 byte status + 8 bytes size. Status transitions: `Ingesting` → `Complete`
+```
+blob_id + seq:0  → hash     (chunk)
+blob_id + seq:1  → hash     (chunk)
+blob_id + seq:2  → (empty)  (EOF)
+```
+
+Status inferred: last entry empty = Complete, otherwise Ingesting.
 
 Readers can prefix-scan `blob_id` to stream chunks as they arrive.
 

@@ -32,51 +32,16 @@ enum Commands {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[repr(u8)]
 enum BlobStatus {
-    Ingesting = 0,
-    Complete = 1,
-}
-
-impl BlobStatus {
-    fn from_byte(b: u8) -> Self {
-        match b {
-            0 => BlobStatus::Ingesting,
-            _ => BlobStatus::Complete,
-        }
-    }
-}
-
-struct BlobMeta {
-    status: BlobStatus,
-    size: u64,
-}
-
-impl BlobMeta {
-    fn to_bytes(&self) -> [u8; 9] {
-        let mut buf = [0u8; 9];
-        buf[0] = self.status as u8;
-        buf[1..9].copy_from_slice(&self.size.to_be_bytes());
-        buf
-    }
-
-    fn from_bytes(bytes: &[u8]) -> Self {
-        let status = BlobStatus::from_byte(bytes[0]);
-        let size = u64::from_be_bytes(bytes[1..9].try_into().unwrap());
-        BlobMeta { status, size }
-    }
+    Ingesting,
+    Complete,
 }
 
 struct Store {
     #[allow(dead_code)]
     db: Database,
     cas: Keyspace,   // hash (32 bytes) -> chunk bytes
-    blobs: Keyspace, // blob_id (16 bytes) -> meta OR blob_id (16) + seq (4) -> hash (32)
-}
-
-// Key helpers
-fn meta_key(id: &Scru128Id) -> [u8; 16] {
-    id.to_bytes()
+    blobs: Keyspace, // blob_id (16) + seq (4) -> hash (32) or empty (EOF)
 }
 
 fn chunk_key(id: &Scru128Id, seq: u32) -> [u8; 20] {
@@ -97,15 +62,7 @@ impl Store {
     fn put<R: Read>(&self, mut reader: R) -> fjall::Result<Scru128Id> {
         let id = scru128::new();
         let mut seq = 0u32;
-        let mut total_size = 0u64;
         let mut buffer = vec![0u8; CHUNK_SIZE];
-
-        // Write initial meta (ingesting)
-        let meta = BlobMeta {
-            status: BlobStatus::Ingesting,
-            size: 0,
-        };
-        self.blobs.insert(meta_key(&id), meta.to_bytes())?;
 
         loop {
             let bytes_read = reader.read(&mut buffer)?;
@@ -115,26 +72,14 @@ impl Store {
 
             let chunk = &buffer[..bytes_read];
             let hash = self.store_chunk(chunk)?;
-            total_size += bytes_read as u64;
 
-            // Write chunk index entry: key = blob_id + seq, value = hash
+            // Write chunk entry: key = blob_id + seq, value = hash
             self.blobs.insert(chunk_key(&id, seq), hash)?;
             seq += 1;
-
-            // Update meta with current size
-            let meta = BlobMeta {
-                status: BlobStatus::Ingesting,
-                size: total_size,
-            };
-            self.blobs.insert(meta_key(&id), meta.to_bytes())?;
         }
 
-        // Finalize meta
-        let meta = BlobMeta {
-            status: BlobStatus::Complete,
-            size: total_size,
-        };
-        self.blobs.insert(meta_key(&id), meta.to_bytes())?;
+        // Write EOF marker: empty value
+        self.blobs.insert(chunk_key(&id, seq), [])?;
 
         Ok(id)
     }
@@ -152,29 +97,36 @@ impl Store {
         Ok(hash)
     }
 
-    fn get_chunks(&self, id: &Scru128Id) -> fjall::Result<Vec<[u8; 32]>> {
+    /// Returns (chunks, is_complete)
+    fn get_blob_entries(&self, id: &Scru128Id) -> fjall::Result<(Vec<[u8; 32]>, bool)> {
         let mut chunks = Vec::new();
+        let mut is_complete = false;
         let prefix = id.to_bytes();
 
         for item in self.blobs.prefix(Slice::from(prefix.as_slice())) {
-            let (key, value) = item.into_inner()?;
-            // Skip meta entry (16 bytes), only process chunk entries (20 bytes)
-            if key.len() == 20 {
+            let (_, value) = item.into_inner()?;
+            if value.is_empty() {
+                is_complete = true;
+            } else {
                 let hash: [u8; 32] = value.as_ref().try_into().unwrap();
                 chunks.push(hash);
             }
         }
-        Ok(chunks)
+        Ok((chunks, is_complete))
     }
 
     fn get<W: Write>(&self, id: Scru128Id, mut writer: W) -> fjall::Result<Option<u64>> {
-        // Check if blob exists
-        if self.blobs.get(meta_key(&id))?.is_none() {
-            return Ok(None);
+        let (chunks, _) = self.get_blob_entries(&id)?;
+
+        if chunks.is_empty() {
+            // Check if blob exists at all (might be empty blob with just EOF)
+            if self.blobs.prefix(Slice::from(id.to_bytes().as_slice())).next().is_none() {
+                return Ok(None);
+            }
         }
 
         let mut written = 0u64;
-        for hash in self.get_chunks(&id)? {
+        for hash in chunks {
             let chunk = self.cas.get(hash)?.expect("missing chunk");
             writer.write_all(&chunk)?;
             written += chunk.len() as u64;
@@ -183,47 +135,70 @@ impl Store {
         Ok(Some(written))
     }
 
-    fn list(&self) -> fjall::Result<Vec<(Scru128Id, BlobMeta, usize)>> {
+    fn list(&self) -> fjall::Result<Vec<(Scru128Id, BlobStatus, usize, u64)>> {
         let mut results = Vec::new();
         let mut current_id: Option<Scru128Id> = None;
         let mut chunk_count = 0usize;
-        let mut current_meta: Option<BlobMeta> = None;
+        let mut is_complete = false;
+        let mut size = 0u64;
 
         for item in self.blobs.iter() {
             let (key, value) = item.into_inner()?;
+            let id = Scru128Id::from_bytes(key[0..16].try_into().unwrap());
 
-            if key.len() == 16 {
-                // Meta entry - flush previous if any
-                if let (Some(id), Some(meta)) = (current_id, current_meta.take()) {
-                    results.push((id, meta, chunk_count));
+            // New blob?
+            if current_id != Some(id) {
+                // Flush previous
+                if let Some(prev_id) = current_id {
+                    let status = if is_complete { BlobStatus::Complete } else { BlobStatus::Ingesting };
+                    results.push((prev_id, status, chunk_count, size));
                 }
-
-                let id = Scru128Id::from_bytes(key.as_ref().try_into().unwrap());
-                let meta = BlobMeta::from_bytes(&value);
                 current_id = Some(id);
-                current_meta = Some(meta);
                 chunk_count = 0;
-            } else if key.len() == 20 {
-                // Chunk entry
+                is_complete = false;
+                size = 0;
+            }
+
+            if value.is_empty() {
+                is_complete = true;
+            } else {
+                let hash: [u8; 32] = value.as_ref().try_into().unwrap();
+                if let Some(chunk) = self.cas.get(hash)? {
+                    size += chunk.len() as u64;
+                }
                 chunk_count += 1;
             }
         }
 
         // Flush last
-        if let (Some(id), Some(meta)) = (current_id, current_meta) {
-            results.push((id, meta, chunk_count));
+        if let Some(id) = current_id {
+            let status = if is_complete { BlobStatus::Complete } else { BlobStatus::Ingesting };
+            results.push((id, status, chunk_count, size));
         }
 
         Ok(results)
     }
 
-    fn info(&self, id: Scru128Id) -> fjall::Result<Option<(BlobMeta, Vec<[u8; 32]>)>> {
-        let Some(meta_bytes) = self.blobs.get(meta_key(&id))? else {
-            return Ok(None);
-        };
-        let meta = BlobMeta::from_bytes(&meta_bytes);
-        let chunks = self.get_chunks(&id)?;
-        Ok(Some((meta, chunks)))
+    fn info(&self, id: Scru128Id) -> fjall::Result<Option<(BlobStatus, Vec<[u8; 32]>, u64)>> {
+        let (chunks, is_complete) = self.get_blob_entries(&id)?;
+
+        // Check if blob exists
+        if chunks.is_empty() && !is_complete {
+            if self.blobs.prefix(Slice::from(id.to_bytes().as_slice())).next().is_none() {
+                return Ok(None);
+            }
+        }
+
+        let status = if is_complete { BlobStatus::Complete } else { BlobStatus::Ingesting };
+
+        let mut size = 0u64;
+        for hash in &chunks {
+            if let Some(chunk) = self.cas.get(hash)? {
+                size += chunk.len() as u64;
+            }
+        }
+
+        Ok(Some((status, chunks, size)))
     }
 }
 
@@ -249,19 +224,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::List => {
-            for (id, meta, chunk_count) in store.list()? {
+            for (id, status, chunk_count, size) in store.list()? {
                 println!(
                     "{}\t{:?}\t{} chunks\t{} bytes",
-                    id, meta.status, chunk_count, meta.size,
+                    id, status, chunk_count, size,
                 );
             }
         }
         Commands::Info { id } => {
             let id: Scru128Id = id.parse().map_err(|_| "invalid scru128 id")?;
             match store.info(id)? {
-                Some((meta, chunks)) => {
-                    println!("Status: {:?}", meta.status);
-                    println!("Size: {} bytes", meta.size);
+                Some((status, chunks, size)) => {
+                    println!("Status: {:?}", status);
+                    println!("Size: {} bytes", size);
                     println!("Chunks: {}", chunks.len());
                     for (i, hash) in chunks.iter().enumerate() {
                         println!("  {}: {}", i, data_encoding::HEXLOWER.encode(hash));
