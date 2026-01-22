@@ -96,7 +96,8 @@ impl Store {
         let hash: [u8; 32] = blake3::hash(data).into();
 
         // Only write if not already present (content-addressed)
-        if self.cas.get(hash)?.is_none() {
+        // TOCTOU race is fine: same hash means same content
+        if !self.cas.contains_key(hash)? {
             self.cas.insert(hash, data)?;
         }
 
