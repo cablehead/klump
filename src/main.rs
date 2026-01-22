@@ -21,7 +21,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Store content from stdin, returns blob ID
-    Put,
+    Put {
+        /// Content type (e.g., text/plain, application/json)
+        #[arg(short = 't', long, default_value = "")]
+        content_type: String,
+    },
     /// Retrieve content by ID, writes to stdout
     Get { id: String },
     /// List all stored blobs
@@ -36,14 +40,20 @@ enum BlobStatus {
     Complete,
 }
 
+struct BlobInfo {
+    content_type: String,
+    chunks: Vec<[u8; 32]>,
+    is_complete: bool,
+}
+
 struct Store {
     #[allow(dead_code)]
     db: Database,
     cas: Keyspace,   // hash (32 bytes) -> chunk bytes
-    blobs: Keyspace, // blob_id (16) + seq (4) -> hash (32) or empty (EOF)
+    blobs: Keyspace, // blob_id + seq -> content_type (seq 0) | hash (32B) | empty (EOF)
 }
 
-fn chunk_key(id: &Scru128Id, seq: u32) -> [u8; 20] {
+fn entry_key(id: &Scru128Id, seq: u32) -> [u8; 20] {
     let mut key = [0u8; 20];
     key[0..16].copy_from_slice(&id.to_bytes());
     key[16..20].copy_from_slice(&seq.to_be_bytes());
@@ -67,10 +77,14 @@ impl Store {
         Ok(Self { db, cas, blobs })
     }
 
-    fn put<R: Read>(&self, mut reader: R) -> fjall::Result<Scru128Id> {
+    fn put<R: Read>(&self, content_type: &str, mut reader: R) -> fjall::Result<Scru128Id> {
         let id = scru128::new();
         let mut seq = 0u32;
         let mut buffer = vec![0u8; CHUNK_SIZE];
+
+        // Seq 0: content-type
+        self.blobs.insert(entry_key(&id, seq), content_type.as_bytes())?;
+        seq += 1;
 
         loop {
             let bytes_read = reader.read(&mut buffer)?;
@@ -82,12 +96,12 @@ impl Store {
             let hash = self.store_chunk(chunk)?;
 
             // Write chunk entry: key = blob_id + seq, value = hash
-            self.blobs.insert(chunk_key(&id, seq), hash)?;
+            self.blobs.insert(entry_key(&id, seq), hash)?;
             seq += 1;
         }
 
         // Write EOF marker: empty value
-        self.blobs.insert(chunk_key(&id, seq), [])?;
+        self.blobs.insert(entry_key(&id, seq), [])?;
 
         Ok(id)
     }
@@ -104,36 +118,48 @@ impl Store {
         Ok(hash)
     }
 
-    /// Returns (chunks, is_complete)
-    fn get_blob_entries(&self, id: &Scru128Id) -> fjall::Result<(Vec<[u8; 32]>, bool)> {
+    fn get_blob_info(&self, id: &Scru128Id) -> fjall::Result<Option<BlobInfo>> {
+        let mut content_type = String::new();
         let mut chunks = Vec::new();
         let mut is_complete = false;
+        let mut seq = 0u32;
         let prefix = id.to_bytes();
 
         for item in self.blobs.prefix(Slice::from(prefix.as_slice())) {
             let (_, value) = item.into_inner()?;
-            if value.is_empty() {
+
+            if seq == 0 {
+                // Content-type
+                content_type = String::from_utf8_lossy(&value).into_owned();
+            } else if value.is_empty() {
+                // EOF
                 is_complete = true;
-            } else {
+            } else if value.len() == 32 {
+                // Chunk hash
                 let hash: [u8; 32] = value.as_ref().try_into().unwrap();
                 chunks.push(hash);
             }
+            seq += 1;
         }
-        Ok((chunks, is_complete))
+
+        if seq == 0 {
+            return Ok(None); // Blob doesn't exist
+        }
+
+        Ok(Some(BlobInfo {
+            content_type,
+            chunks,
+            is_complete,
+        }))
     }
 
     fn get<W: Write>(&self, id: Scru128Id, mut writer: W) -> fjall::Result<Option<u64>> {
-        let (chunks, _) = self.get_blob_entries(&id)?;
-
-        if chunks.is_empty() {
-            // Check if blob exists at all (might be empty blob with just EOF)
-            if self.blobs.prefix(Slice::from(id.to_bytes().as_slice())).next().is_none() {
-                return Ok(None);
-            }
-        }
+        let Some(info) = self.get_blob_info(&id)? else {
+            return Ok(None);
+        };
 
         let mut written = 0u64;
-        for hash in chunks {
+        for hash in info.chunks {
             let chunk = self.cas.get(hash)?.expect("missing chunk");
             writer.write_all(&chunk)?;
             written += chunk.len() as u64;
@@ -142,12 +168,14 @@ impl Store {
         Ok(Some(written))
     }
 
-    fn list(&self) -> fjall::Result<Vec<(Scru128Id, BlobStatus, usize, u64)>> {
+    fn list(&self) -> fjall::Result<Vec<(Scru128Id, BlobStatus, String, usize, u64)>> {
         let mut results = Vec::new();
         let mut current_id: Option<Scru128Id> = None;
+        let mut content_type = String::new();
         let mut chunk_count = 0usize;
         let mut is_complete = false;
         let mut size = 0u64;
+        let mut seq = 0u32;
 
         for item in self.blobs.iter() {
             let (key, value) = item.into_inner()?;
@@ -158,54 +186,55 @@ impl Store {
                 // Flush previous
                 if let Some(prev_id) = current_id {
                     let status = if is_complete { BlobStatus::Complete } else { BlobStatus::Ingesting };
-                    results.push((prev_id, status, chunk_count, size));
+                    results.push((prev_id, status, content_type.clone(), chunk_count, size));
                 }
                 current_id = Some(id);
+                content_type = String::new();
                 chunk_count = 0;
                 is_complete = false;
                 size = 0;
+                seq = 0;
             }
 
-            if value.is_empty() {
+            if seq == 0 {
+                // Content-type
+                content_type = String::from_utf8_lossy(&value).into_owned();
+            } else if value.is_empty() {
                 is_complete = true;
-            } else {
+            } else if value.len() == 32 {
                 let hash: [u8; 32] = value.as_ref().try_into().unwrap();
                 if let Some(chunk) = self.cas.get(hash)? {
                     size += chunk.len() as u64;
                 }
                 chunk_count += 1;
             }
+            seq += 1;
         }
 
         // Flush last
         if let Some(id) = current_id {
             let status = if is_complete { BlobStatus::Complete } else { BlobStatus::Ingesting };
-            results.push((id, status, chunk_count, size));
+            results.push((id, status, content_type, chunk_count, size));
         }
 
         Ok(results)
     }
 
-    fn info(&self, id: Scru128Id) -> fjall::Result<Option<(BlobStatus, Vec<[u8; 32]>, u64)>> {
-        let (chunks, is_complete) = self.get_blob_entries(&id)?;
+    fn info(&self, id: Scru128Id) -> fjall::Result<Option<(BlobStatus, String, Vec<[u8; 32]>, u64)>> {
+        let Some(info) = self.get_blob_info(&id)? else {
+            return Ok(None);
+        };
 
-        // Check if blob exists
-        if chunks.is_empty() && !is_complete {
-            if self.blobs.prefix(Slice::from(id.to_bytes().as_slice())).next().is_none() {
-                return Ok(None);
-            }
-        }
-
-        let status = if is_complete { BlobStatus::Complete } else { BlobStatus::Ingesting };
+        let status = if info.is_complete { BlobStatus::Complete } else { BlobStatus::Ingesting };
 
         let mut size = 0u64;
-        for hash in &chunks {
+        for hash in &info.chunks {
             if let Some(chunk) = self.cas.get(hash)? {
                 size += chunk.len() as u64;
             }
         }
 
-        Ok(Some((status, chunks, size)))
+        Ok(Some((status, info.content_type, info.chunks, size)))
     }
 }
 
@@ -214,9 +243,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Store::open(cli.store)?;
 
     match cli.command {
-        Commands::Put => {
+        Commands::Put { content_type } => {
             let stdin = std::io::stdin();
-            let id = store.put(stdin.lock())?;
+            let id = store.put(&content_type, stdin.lock())?;
             println!("{}", id);
         }
         Commands::Get { id } => {
@@ -231,18 +260,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::List => {
-            for (id, status, chunk_count, size) in store.list()? {
+            for (id, status, content_type, chunk_count, size) in store.list()? {
+                let ct = if content_type.is_empty() { "-" } else { &content_type };
                 println!(
-                    "{}\t{:?}\t{} chunks\t{} bytes",
-                    id, status, chunk_count, size,
+                    "{}\t{:?}\t{}\t{} chunks\t{} bytes",
+                    id, status, ct, chunk_count, size,
                 );
             }
         }
         Commands::Info { id } => {
             let id: Scru128Id = id.parse().map_err(|_| "invalid scru128 id")?;
             match store.info(id)? {
-                Some((status, chunks, size)) => {
+                Some((status, content_type, chunks, size)) => {
                     println!("Status: {:?}", status);
+                    println!("Content-Type: {}", if content_type.is_empty() { "-" } else { &content_type });
                     println!("Size: {} bytes", size);
                     println!("Chunks: {}", chunks.len());
                     for (i, hash) in chunks.iter().enumerate() {

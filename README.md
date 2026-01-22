@@ -15,12 +15,13 @@ Storing large blobs requires buffering entire content before write. Can't stream
 
 Two keyspaces:
 - `cas`: `hash (32B) → chunk bytes`
-- `blobs`: `blob_id (16B) + seq (4B) → hash (32B)` or `→ empty (EOF)`
+- `blobs`: `blob_id (16B) + seq (4B) → content-type (seq 0)` | `hash (32B)` | `empty (EOF)`
 
 ```
-blob_id + seq:0  → hash     (chunk)
-blob_id + seq:1  → hash     (chunk)
-blob_id + seq:2  → (empty)  (EOF)
+blob_id + seq:0  → "text/plain"  (content-type)
+blob_id + seq:1  → hash          (chunk)
+blob_id + seq:2  → hash          (chunk)
+blob_id + seq:3  → (empty)       (EOF)
 ```
 
 Status inferred: last entry empty = Complete, otherwise Ingesting.
@@ -30,10 +31,10 @@ Readers can prefix-scan `blob_id` to stream chunks as they arrive.
 ## Usage
 
 ```
-echo "hello" | klump put     # returns scru128 id
-klump get <id>               # streams content to stdout
-klump list                   # show all blobs
-klump info <id>              # show chunks
+echo "hello" | klump put -t text/plain   # returns scru128 id
+klump get <id>                           # streams content to stdout
+klump list                               # show all blobs
+klump info <id>                          # show chunks
 ```
 
 ## Why
