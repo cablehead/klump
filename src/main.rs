@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use ident::{human, parse_ref};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use store::{Store, DEFAULT_CONTENT_TYPE};
 
@@ -29,15 +29,6 @@ use store::{Store, DEFAULT_CONTENT_TYPE};
         prefix of an id."
 )]
 struct Cli {
-    /// Store directory
-    #[arg(long, env = "KLUMP_STORE", default_value = "~/.klump", global = true)]
-    store: String,
-    /// Block cache, in MiB. Ignored when a daemon is serving.
-    #[arg(long, env = "KLUMP_CACHE_MB", default_value_t = 64, global = true)]
-    cache_mb: u64,
-    /// Daemon socket. Used automatically when something is listening on it.
-    #[arg(long, env = "KLUMP_SOCKET", default_value = "~/.klump.sock", global = true)]
-    socket: String,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -46,6 +37,8 @@ struct Cli {
 enum Cmd {
     /// Store content from a file or stdin, and print its blob id
     Put {
+        /// Store directory
+        store: PathBuf,
         /// File to read; omit or use - for stdin
         file: Option<PathBuf>,
         /// Content type, as an HTTP Content-Type value
@@ -64,6 +57,8 @@ enum Cmd {
     },
     /// Write a blob's content to stdout or a file
     Get {
+        /// Store directory
+        store: PathBuf,
         /// Blob id, id prefix, or root hash
         reference: String,
         /// Write here instead of stdout
@@ -76,12 +71,16 @@ enum Cmd {
     /// List blobs, oldest first
     #[command(alias = "list")]
     Ls {
+        /// Store directory
+        store: PathBuf,
         /// Show root hashes as well
         #[arg(short, long)]
         long: bool,
     },
     /// Show one blob in detail
     Info {
+        /// Store directory
+        store: PathBuf,
         reference: String,
         /// List every chunk
         #[arg(short, long)]
@@ -90,26 +89,66 @@ enum Cmd {
     /// Delete blobs, reclaiming chunks nothing else references
     #[command(alias = "remove")]
     Rm {
+        /// Store directory
+        store: PathBuf,
         #[arg(required = true)]
         references: Vec<String>,
     },
     /// Re-read a blob and check it against its root hash
-    Verify { reference: String },
+    Verify {
+        /// Store directory
+        store: PathBuf,
+        reference: String,
+    },
     /// Delete chunks nothing references
-    Gc,
+    Gc {
+        /// Store directory
+        store: PathBuf,
+    },
     /// Summarise the store
-    Stats,
-    /// Run the daemon
-    Serve {},
+    Stats {
+        /// Store directory
+        store: PathBuf,
+    },
+    /// Run the daemon, holding the store and serving it on <STORE>/sock
+    Serve {
+        /// Store directory
+        store: PathBuf,
+        /// Block cache, in MiB
+        #[arg(long, default_value_t = 64)]
+        cache_mb: u64,
+    },
 }
 
-fn expand(p: &str) -> PathBuf {
-    if let Some(rest) = p.strip_prefix("~/") {
+impl Cmd {
+    /// Every command names the store it works on. The socket lives inside it,
+    /// so that one path is all a client and a server have to agree on.
+    fn store(&self) -> &PathBuf {
+        match self {
+            Cmd::Put { store, .. }
+            | Cmd::Get { store, .. }
+            | Cmd::Ls { store, .. }
+            | Cmd::Info { store, .. }
+            | Cmd::Rm { store, .. }
+            | Cmd::Verify { store, .. }
+            | Cmd::Gc { store }
+            | Cmd::Stats { store }
+            | Cmd::Serve { store, .. } => store,
+        }
+    }
+}
+
+/// The daemon listens inside the store directory, the way xs does, so there
+/// is no second path to keep in sync.
+const SOCKET_NAME: &str = "sock";
+
+fn expand_path(p: &Path) -> PathBuf {
+    if let Some(rest) = p.to_str().and_then(|s| s.strip_prefix("~/")) {
         if let Ok(home) = std::env::var("HOME") {
             return PathBuf::from(home).join(rest);
         }
     }
-    PathBuf::from(p)
+    p.to_path_buf()
 }
 
 fn ratio(a: u64, b: u64) -> f64 {
@@ -129,24 +168,23 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let socket = expand(&cli.socket);
+    let store_path = expand_path(cli.cmd.store());
+    let socket = store_path.join(SOCKET_NAME);
 
     // serve always takes the store itself; everything else prefers a daemon
     // if one is holding it, because fjall allows only one process at a time.
-    if !matches!(cli.cmd, Cmd::Serve { }) {
-        if let Some(c) = client::Client::connect(&socket) {
-            return run_remote(cli.cmd, c);
-        }
-    }
-
-    let store = Store::open(expand(&cli.store), cli.cache_mb)?;
-    if let Cmd::Serve { } = cli.cmd {
+    if let Cmd::Serve { cache_mb, .. } = cli.cmd {
+        let store = Store::open(&store_path, cache_mb)?;
         return serve::serve(store, &socket);
     }
+    if let Some(c) = client::Client::connect(&socket) {
+        return run_remote(cli.cmd, c);
+    }
+    let store = Store::open(&store_path, 64)?;
 
     match cli.cmd {
-        Cmd::Serve { } => unreachable!(),
-        Cmd::Put { file, content_type, root, verbose, tee } => {
+        Cmd::Serve { .. } => unreachable!(),
+        Cmd::Put { file, content_type, root, verbose, tee, .. } => {
             let ct = content_type.unwrap_or_else(|| DEFAULT_CONTENT_TYPE.into());
             let started = Instant::now();
             let sink = if tee { Some(io::stdout().lock()) } else { None };
@@ -178,7 +216,7 @@ fn run() -> Result<()> {
             }
         }
 
-        Cmd::Get { reference, output, follow } => {
+        Cmd::Get { reference, output, follow, .. } => {
             let id = store.resolve(&parse_ref(&reference)?)?;
             match output {
                 Some(p) => {
@@ -193,7 +231,7 @@ fn run() -> Result<()> {
             }
         }
 
-        Cmd::Ls { long } => {
+        Cmd::Ls { long, .. } => {
             for id in store.ids()? {
                 let Some(b) = store.load(&id)? else { continue };
                 let size = b.size().map(human).unwrap_or_else(|| "-".into());
@@ -210,7 +248,7 @@ fn run() -> Result<()> {
             }
         }
 
-        Cmd::Info { reference, chunks } => {
+        Cmd::Info { reference, chunks, .. } => {
             let id = store.resolve(&parse_ref(&reference)?)?;
             let b = store.load(&id)?.context("blob not found")?;
             println!("id            {}", b.id);
@@ -241,7 +279,7 @@ fn run() -> Result<()> {
             }
         }
 
-        Cmd::Rm { references } => {
+        Cmd::Rm { references, .. } => {
             let mut chunks = 0;
             let mut bytes = 0u64;
             for r in &references {
@@ -254,7 +292,7 @@ fn run() -> Result<()> {
             eprintln!("freed {chunks} chunks, {}", human(bytes));
         }
 
-        Cmd::Verify { reference } => {
+        Cmd::Verify { reference, .. } => {
             let id = store.resolve(&parse_ref(&reference)?)?;
             let started = Instant::now();
             let (ok, size) = store.verify(&id)?;
@@ -265,12 +303,12 @@ fn run() -> Result<()> {
             println!("ok  {id}  {} in {}", human(size), store::since(started));
         }
 
-        Cmd::Gc => {
+        Cmd::Gc { .. } => {
             let (n, bytes) = store.gc()?;
             println!("removed {n} unreferenced chunks, {}", human(bytes));
         }
 
-        Cmd::Stats => {
+        Cmd::Stats { .. } => {
             let s = store.stats()?;
             println!("store          {}", store.path().display());
             let ing = match s.ingesting {
@@ -324,7 +362,7 @@ fn run_remote(cmd: Cmd, mut c: client::Client) -> Result<()> {
     match cmd {
         Cmd::Serve { .. } => unreachable!("serve is always local"),
 
-        Cmd::Put { file, content_type, root, verbose, tee } => {
+        Cmd::Put { file, content_type, root, verbose, tee, .. } => {
             let ct = content_type.unwrap_or_else(|| DEFAULT_CONTENT_TYPE.into());
             let started = Instant::now();
             let mut stdout = io::stdout();
@@ -378,7 +416,7 @@ fn run_remote(cmd: Cmd, mut c: client::Client) -> Result<()> {
             }
         }
 
-        Cmd::Get { reference, output, follow } => {
+        Cmd::Get { reference, output, follow, .. } => {
             let path = if follow {
                 format!("/blobs/{reference}?follow=1")
             } else {
@@ -403,7 +441,7 @@ fn run_remote(cmd: Cmd, mut c: client::Client) -> Result<()> {
             }
         }
 
-        Cmd::Ls { long } => {
+        Cmd::Ls { long, .. } => {
             let v = c.json("GET", "/blobs")?;
             for b in v.as_array().cloned().unwrap_or_default() {
                 let size = b["size"].as_u64().map(human).unwrap_or_else(|| "-".into());
@@ -421,7 +459,7 @@ fn run_remote(cmd: Cmd, mut c: client::Client) -> Result<()> {
             }
         }
 
-        Cmd::Info { reference, chunks } => {
+        Cmd::Info { reference, chunks, .. } => {
             let path = if chunks {
                 format!("/blobs/{reference}?meta=1&chunks=1")
             } else {
@@ -451,7 +489,7 @@ fn run_remote(cmd: Cmd, mut c: client::Client) -> Result<()> {
             }
         }
 
-        Cmd::Rm { references } => {
+        Cmd::Rm { references, .. } => {
             let mut n = 0u64;
             let mut bytes = 0u64;
             for r in &references {
@@ -463,7 +501,7 @@ fn run_remote(cmd: Cmd, mut c: client::Client) -> Result<()> {
             eprintln!("freed {n} chunks, {}", human(bytes));
         }
 
-        Cmd::Verify { reference } => {
+        Cmd::Verify { reference, .. } => {
             let started = Instant::now();
             let v = c.json("POST", &format!("/blobs/{reference}/verify"))?;
             let id = v["id"].as_str().unwrap_or(&reference);
@@ -479,7 +517,7 @@ fn run_remote(cmd: Cmd, mut c: client::Client) -> Result<()> {
             }
         }
 
-        Cmd::Gc => {
+        Cmd::Gc { .. } => {
             let v = c.json("POST", "/gc")?;
             println!(
                 "removed {} unreferenced chunks, {}",
@@ -488,7 +526,7 @@ fn run_remote(cmd: Cmd, mut c: client::Client) -> Result<()> {
             );
         }
 
-        Cmd::Stats => {
+        Cmd::Stats { .. } => {
             let v = c.json("GET", "/stats")?;
             let g = |k: &str| v[k].as_u64().unwrap_or(0);
             let ing = match g("ingesting") {

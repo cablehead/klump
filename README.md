@@ -34,14 +34,14 @@ nothing compresses and the only saving on show is dedup.
 $ head -c 1000000 /dev/urandom > a.bin
 $ cat a.bin > b.bin && head -c 100000 /dev/urandom >> b.bin
 
-$ klump put a.bin -v
+$ klump put ./store a.bin -v
 03guauzkos037euah9u9uvz7z
 977K in 16 chunks, 1ms at 663M/s, root gboqvz6qmpkjip3nvwtsebdtpn42caociumbxp7pll6kvzbksoka
 
-$ klump put b.bin
+$ klump put ./store b.bin
 03guauzkplma73c5puvr2ke4w
 
-$ klump stats
+$ klump stats ./store
 blobs          2
 distinct roots 2
 chunks         18 unique, 33 referenced
@@ -59,16 +59,16 @@ Blobs come back by id, by an unambiguous prefix of one, or by the hash of
 their own content:
 
 ```console
-$ klump get 03guauzkos > copy.bin
-$ klump get gboqvz6qmpkjip3nvwtsebdtpn42caociumbxp7pll6kvzbksoka | cmp - a.bin
-$ klump verify 03guauzkos
+$ klump get ./store 03guauzkos > copy.bin
+$ klump get ./store gboqvz6qmpkjip3nvwtsebdtpn42caociumbxp7pll6kvzbksoka | cmp - a.bin
+$ klump verify ./store 03guauzkos
 ok  03guauzkos037euah9u9uvz7z  977K in 0ms
 ```
 
 Deleting a blob reclaims only the chunks nothing else wants:
 
 ```console
-$ klump rm 03guauzkpl
+$ klump rm ./store 03guauzkpl
 removed 03guauzkplma73c5puvr2ke4w
 freed 2 chunks, 114K
 ```
@@ -79,7 +79,9 @@ freed 2 chunks, 114K
 cargo install --path .
 ```
 
-The store lives at `~/.klump` unless `--store` or `KLUMP_STORE` says otherwise.
+Every command takes the store directory as its first argument. The daemon's
+socket lives inside it as `<store>/sock`, so that one path is all a client and
+a server have to agree on.
 
 ## Two names
 
@@ -108,10 +110,10 @@ legitimate state, not a mistake, so `roots` is a multimap and `info` will tell
 you who else is holding the same bytes:
 
 ```console
-$ klump put a.bin          # the same bytes, a second time
+$ klump put ./store a.bin    # the same bytes, a second time
 03guav5z7u0axh832vlvslch1
 
-$ klump info 03guauzkos
+$ klump info ./store 03guauzkos
 id            03guauzkos037euah9u9uvz7z
 status        complete
 content-type  application/octet-stream
@@ -131,7 +133,7 @@ consumes in a single pass. The blob name goes to stderr, because stdout is
 carrying the bytes:
 
 ```console
-$ ffmpeg ... | klump put --tee -t video/mp4 2>id.txt | mpv -
+$ ffmpeg ... | klump put ./store --tee -t video/mp4 2>id.txt | mpv -
 ```
 
 `get --follow` keeps reading while a blob is still being ingested and returns
@@ -217,10 +219,10 @@ HTTP over a unix socket; the CLI notices the socket and routes through it. Same
 commands, same output, either way.
 
 ```console
-$ klump serve &
-klump serving ~/.klump on ~/.klump.sock
+$ klump serve /var/klump &
+klump serving /var/klump on /var/klump/sock
 
-$ klump put video.mp4 -t video/mp4    # goes over the socket now
+$ klump put /var/klump video.mp4 -t video/mp4   # over the socket now
 03guee76zwfg4u8rszu96hxfp
 ```
 
@@ -250,7 +252,7 @@ so an upload only learns its id at the end. HTTP/2 frames request and response
 independently, so the id comes back straight away:
 
 ```console
-$ slow-producer | curl --http2-prior-knowledge --unix-socket ~/.klump.sock \
+$ slow-producer | curl --http2-prior-knowledge --unix-socket /var/klump/sock \
     -X POST -T - http://localhost/blobs
   +   7ms  {"id":"03gued3ej4mpoy46e6gp53ffe"}    <- upload runs for another 3.2s
   ...
@@ -267,8 +269,8 @@ concurrent streams peaks at 24MB of memory.
 ### Following
 
 ```console
-$ klump get <id> --follow
-$ curl --unix-socket ~/.klump.sock "http://localhost/blobs/<id>?follow=1"
+$ klump get /var/klump <id> --follow
+$ curl --unix-socket /var/klump/sock "http://localhost/blobs/<id>?follow=1"
 ```
 
 Returns when the blob's trailer lands. The writer and every reader are the same
@@ -281,7 +283,7 @@ than on a timer.
 once and the chunks survive while anyone still holds the blob open:
 
 ```console
-$ klump rm <id>          # while a follower is mid-stream
+$ klump rm /var/klump <id>   # while a follower is mid-stream
 removed <id>
 freed 0 chunks, 0B       # deferred: someone still has it open
 ```
