@@ -799,7 +799,9 @@ fn pump(conn: &mut Conn, sv: &mut Server) -> Result<()> {
             continue; // still blocked; try again when the window opens
         }
 
-        let (hashes, complete) = sv.store.chunks_from(&bid, from)?;
+        // One pass sends at most a few chunks, so read a window rather than
+        // the whole remaining list.
+        let (hashes, complete) = sv.store.chunks_from(&bid, from, 32)?;
         let mut sent = 0;
         for h in &hashes {
             if conn.congested(req) {

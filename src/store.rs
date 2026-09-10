@@ -578,27 +578,37 @@ impl Store {
         Ok((n, bytes))
     }
 
-    /// Chunk hashes from `from` onward, without rescanning the whole blob.
-    /// A follower calls this every time it wakes, so it must cost what
-    /// arrived rather than what exists.
-    pub fn chunks_from(&self, id: &Scru128Id, from: u32) -> Result<(Vec<Hash>, bool)> {
+    /// Up to `limit` chunk hashes from `from` onward, and whether the blob is
+    /// complete.
+    ///
+    /// Bounded because a reader calls this on every pass of the event loop. An
+    /// unbounded scan would allocate the whole remaining chunk list each time,
+    /// which for a 40 GB blob is 20 MB per pass to send a few chunks.
+    pub fn chunks_from(&self, id: &Scru128Id, from: u32, limit: usize) -> Result<(Vec<Hash>, bool)> {
         let mut start = id.to_bytes().to_vec();
         start.extend_from_slice(&from.to_be_bytes());
         let mut end = id.to_bytes().to_vec();
         end.extend_from_slice(&u32::MAX.to_be_bytes());
 
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(limit.min(64));
         let mut complete = false;
+        let mut truncated = false;
         for item in self.blobs.range(start..=end) {
             let (k, v) = item.into_inner()?;
             let seq = u32::from_be_bytes(k[16..20].try_into().unwrap());
             if seq == TRAILER_SEQ {
                 complete = true;
             } else if v.len() == 32 {
+                if out.len() == limit {
+                    truncated = true;
+                    break;
+                }
                 out.push(<Hash>::try_from(v.as_ref()).unwrap());
             }
         }
-        Ok((out, complete))
+        // Stopping early says nothing about the trailer, and there is more to
+        // send regardless, so the caller must not treat this as the end.
+        Ok((out, complete && !truncated))
     }
 
     pub fn chunk(&self, hash: &Hash) -> Result<Option<Vec<u8>>> {
