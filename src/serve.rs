@@ -31,6 +31,9 @@ use crate::store::Store;
 use scru128::Scru128Id;
 
 const LISTENER_KEY: usize = 0;
+/// How much unwritten response we are willing to hold per connection before
+/// pausing the reader that is producing it.
+const OUT_HIGH_WATER: usize = 1 << 20;
 
 /// Which request a response belongs to. HTTP/1.1 has one in flight per
 /// connection, HTTP/2 has many, so only one of these carries an id.
@@ -194,11 +197,18 @@ impl Conn {
                             ctype: get("content-type"),
                         }
                     }
-                    H2Event::DataReceived { stream_id, data, end_stream, .. } => Incoming::Body {
-                        id: ReqId::H2(stream_id),
-                        data,
-                        end: end_stream,
-                    },
+                    H2Event::DataReceived { stream_id, data, end_stream, .. } => {
+                        // Replenish the flow-control window we just consumed, for
+                        // the stream and for the connection. Without this a client
+                        // stops dead after the initial 65535 bytes, waiting for a
+                        // WINDOW_UPDATE that never comes.
+                        if !data.is_empty() {
+                            let n = data.len() as u32;
+                            c.send_window_update(stream_id, n)?;
+                            c.send_window_update(StreamId::Connection, n)?;
+                        }
+                        Incoming::Body { id: ReqId::H2(stream_id), data, end: end_stream }
+                    }
                     H2Event::StreamClosed { stream_id, .. } => Incoming::End(ReqId::H2(stream_id)),
                     H2Event::ConnectionError { .. } | H2Event::GoawayReceived { .. } => {
                         Incoming::Closed
@@ -239,6 +249,19 @@ impl Conn {
         }
         self.out.drain(..sent);
         Ok(())
+    }
+
+    /// Whether to stop feeding this response for now. Either our own
+    /// outbound buffer is deep enough, or HTTP/2 flow control says the
+    /// peer has not made room.
+    fn congested(&self, id: ReqId) -> bool {
+        if self.out.len() >= OUT_HIGH_WATER {
+            return true;
+        }
+        match (&self.codec, id) {
+            (Codec::H2(c), ReqId::H2(sid)) => c.has_pending_send_data(sid),
+            _ => false,
+        }
     }
 
     fn wants_write(&self) -> bool {
@@ -476,6 +499,8 @@ impl Handles {
 /// A response still being written out. The loop pumps these every pass, so a
 /// follower sees a chunk in the same iteration that stored it.
 struct Out {
+    /// Bytes of the current chunk the peer has not taken yet.
+    carry: Vec<u8>,
     req: ReqId,
     id: Scru128Id,
     next: u32,
@@ -563,6 +588,13 @@ impl Conn {
             (Codec::H2(c), ReqId::H2(sid)) => {
                 if !data.is_empty() || end {
                     c.send_data(sid, data.to_vec(), end)?;
+                }
+                // Move it out of the codec now rather than in write_out, so
+                // the high-water check below sees these bytes. Otherwise a
+                // peer advertising a large window lets us queue a whole blob
+                // into the codec before anything notices.
+                while let Some(chunk) = c.poll_output() {
+                    self.out.extend_from_slice(&chunk);
                 }
             }
             _ => {}
@@ -705,7 +737,7 @@ fn route(conn: &mut Conn, sv: &mut Server, id: ReqId, method: &str, raw_path: &s
                         extra.push(("klump-root".into(), t.root.clone()));
                     }
                     conn.head(id, 200, extra, len)?;
-                    conn.outs.push(Out { req: id, id: bid, next: 1, follow });
+                    conn.outs.push(Out { carry: Vec::new(), req: id, id: bid, next: 1, follow });
                 }
                 ("DELETE", _) => {
                     let hashes = sv.store.unlink(&bid)?;
@@ -732,6 +764,22 @@ fn route(conn: &mut Conn, sv: &mut Server, id: ReqId, method: &str, raw_path: &s
 
 /// Push whatever has arrived for each in-flight read. Called every pass, so
 /// a follower is served in the same iteration that committed the chunk.
+/// One DATA frame's worth. The codec's per-stream send buffer is fixed at
+/// 65535 bytes and is never resized, so a 64K chunk cannot be handed over
+/// whole; it has to go in pieces that fit alongside whatever flow control has
+/// not let out yet.
+const PIECE: usize = 16 * 1024;
+
+/// Push as much of this response's carry as the peer will take.
+fn drain_carry(conn: &mut Conn, i: usize, req: ReqId) -> Result<()> {
+    while !conn.outs[i].carry.is_empty() && !conn.congested(req) {
+        let take = PIECE.min(conn.outs[i].carry.len());
+        let piece: Vec<u8> = conn.outs[i].carry.drain(..take).collect();
+        conn.body(req, &piece, false)?;
+    }
+    Ok(())
+}
+
 fn pump(conn: &mut Conn, sv: &mut Server) -> Result<()> {
     let mut finished = Vec::new();
     for i in 0..conn.outs.len() {
@@ -739,20 +787,38 @@ fn pump(conn: &mut Conn, sv: &mut Server) -> Result<()> {
             let o = &conn.outs[i];
             (o.req, o.id, o.next, o.follow)
         };
-        let (hashes, complete) = sv.store.chunks_from(&bid, from)?;
-        for h in &hashes {
-            let Some(chunk) = sv.store.chunk(h)? else { continue };
-            conn.body(req, &chunk, false)?;
+
+        // Whatever the peer would not take last pass goes first.
+        drain_carry(conn, i, req)?;
+        if !conn.outs[i].carry.is_empty() {
+            continue; // still blocked; try again when the window opens
         }
-        conn.outs[i].next += hashes.len() as u32;
+
+        let (hashes, complete) = sv.store.chunks_from(&bid, from)?;
+        let mut sent = 0;
+        for h in &hashes {
+            if conn.congested(req) {
+                break;
+            }
+            let Some(chunk) = sv.store.chunk(h)? else { continue };
+            conn.outs[i].carry = chunk;
+            sent += 1;
+            drain_carry(conn, i, req)?;
+            if !conn.outs[i].carry.is_empty() {
+                break;
+            }
+        }
+        conn.outs[i].next = from + sent as u32;
+
+        let drained = sent == hashes.len() && conn.outs[i].carry.is_empty();
         // A blob unlinked mid-read stops growing; end at what we have.
         let gone = sv.store.load(&bid)?.is_none();
-        if complete || gone || !follow {
+        if drained && (complete || gone || !follow) {
             conn.body(req, &[], true)?;
-            finished.push((i, bid, req));
+            finished.push((i, bid));
         }
     }
-    for (i, bid, _) in finished.iter().rev() {
+    for (i, bid) in finished.iter().rev() {
         conn.outs.remove(*i);
         sv.handles.close(&sv.store, *bid);
     }
