@@ -1,292 +1,295 @@
-use clap::{Parser, Subcommand};
-use fjall::{CompressionType, Database, Keyspace, KeyspaceCreateOptions, KvSeparationOptions, Slice};
-use scru128::Scru128Id;
-use std::io::{Read, Write};
-use std::path::PathBuf;
+//! klump: streaming content-addressed blob storage on fjall.
 
-const CHUNK_SIZE: usize = 64 * 1024; // 64KB
+mod ident;
+mod store;
+
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use ident::{human, parse_ref};
+use std::io::{self, Write};
+use std::path::PathBuf;
+use std::time::Instant;
+use store::{Store, DEFAULT_CONTENT_TYPE};
 
 #[derive(Parser)]
-#[command(name = "klump")]
-#[command(about = "Chunked blob storage experiment")]
+#[command(
+    name = "klump",
+    version,
+    about = "Streaming content-addressed blob storage",
+    long_about = "Streaming content-addressed blob storage.\n\n\
+        Content is split into 64K chunks, each stored under its BLAKE3 hash, so \
+        identical chunks are stored once however many blobs share them. Nothing is \
+        buffered whole: chunks are committed as they arrive and streamed back one \
+        at a time.\n\n\
+        Blobs are named twice. The id is a scru128 handle, minted when ingest opens. \
+        The root is the BLAKE3 hash of the content, known only at EOF, and shared by \
+        any two blobs holding the same bytes. Commands take either, or an unambiguous \
+        prefix of an id."
+)]
 struct Cli {
-    /// Path to the store directory
-    #[arg(short, long, default_value = ".klump")]
-    store: PathBuf,
-
+    /// Store directory
+    #[arg(long, env = "KLUMP_STORE", default_value = "~/.klump", global = true)]
+    store: String,
+    /// Block cache, in MiB
+    #[arg(long, env = "KLUMP_CACHE_MB", default_value_t = 64, global = true)]
+    cache_mb: u64,
     #[command(subcommand)]
-    command: Commands,
+    cmd: Cmd,
 }
 
 #[derive(Subcommand)]
-enum Commands {
-    /// Store content from stdin, returns blob ID
+enum Cmd {
+    /// Store content from a file or stdin, and print its blob id
     Put {
-        /// Content type (e.g., text/plain, application/json)
-        #[arg(short = 't', long, default_value = "")]
-        content_type: String,
+        /// File to read; omit or use - for stdin
+        file: Option<PathBuf>,
+        /// Content type, as an HTTP Content-Type value
+        #[arg(short = 't', long)]
+        content_type: Option<String>,
+        /// Print the root hash instead of the blob id
+        #[arg(long)]
+        root: bool,
+        /// Report size, chunks and rate on stderr
+        #[arg(short, long)]
+        verbose: bool,
+        /// Write the content onward to stdout as it is stored, so a pipeline
+        /// consumes it in the same pass. The name goes to stderr instead.
+        #[arg(long)]
+        tee: bool,
     },
-    /// Retrieve content by ID, writes to stdout
-    Get { id: String },
-    /// List all stored blobs
-    List,
-    /// Show info about a blob
-    Info { id: String },
+    /// Write a blob's content to stdout or a file
+    Get {
+        /// Blob id, id prefix, or root hash
+        reference: String,
+        /// Write here instead of stdout
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Keep streaming while the blob is still being ingested
+        #[arg(short, long)]
+        follow: bool,
+    },
+    /// List blobs, oldest first
+    #[command(alias = "list")]
+    Ls {
+        /// Show root hashes as well
+        #[arg(short, long)]
+        long: bool,
+    },
+    /// Show one blob in detail
+    Info {
+        reference: String,
+        /// List every chunk
+        #[arg(short, long)]
+        chunks: bool,
+    },
+    /// Delete blobs, reclaiming chunks nothing else references
+    #[command(alias = "remove")]
+    Rm {
+        #[arg(required = true)]
+        references: Vec<String>,
+    },
+    /// Re-read a blob and check it against its root hash
+    Verify { reference: String },
+    /// Delete chunks nothing references
+    Gc,
+    /// Summarise the store
+    Stats,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum BlobStatus {
-    Ingesting,
-    Complete,
+fn expand(p: &str) -> PathBuf {
+    if let Some(rest) = p.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(p)
 }
 
-struct BlobInfo {
-    content_type: String,
-    chunks: Vec<[u8; 32]>,
-    is_complete: bool,
-}
-
-struct Store {
-    #[allow(dead_code)]
-    db: Database,
-    cas: Keyspace,   // hash (32 bytes) -> chunk bytes
-    blobs: Keyspace, // blob_id + seq -> content_type (seq 0) | hash (32B) | empty (EOF)
-}
-
-fn entry_key(id: &Scru128Id, seq: u32) -> [u8; 20] {
-    let mut key = [0u8; 20];
-    key[0..16].copy_from_slice(&id.to_bytes());
-    key[16..20].copy_from_slice(&seq.to_be_bytes());
-    key
-}
-
-impl Store {
-    fn open(path: PathBuf) -> fjall::Result<Self> {
-        let db = Database::builder(path).open()?;
-
-        // CAS: large values (64KB chunks), use KV-separation with LZ4
-        let cas = db.keyspace("cas", || {
-            KeyspaceCreateOptions::default().with_kv_separation(Some(
-                KvSeparationOptions::default().compression(CompressionType::Lz4),
-            ))
-        })?;
-
-        // Blobs: small keys/values (20B -> 32B or empty), defaults fine
-        let blobs = db.keyspace("blobs", || KeyspaceCreateOptions::default())?;
-
-        Ok(Self { db, cas, blobs })
-    }
-
-    fn put<R: Read>(&self, content_type: &str, mut reader: R) -> fjall::Result<Scru128Id> {
-        let id = scru128::new();
-        let mut seq = 0u32;
-        let mut buffer = vec![0u8; CHUNK_SIZE];
-
-        // Seq 0: content-type
-        self.blobs.insert(entry_key(&id, seq), content_type.as_bytes())?;
-        seq += 1;
-
-        loop {
-            let bytes_read = reader.read(&mut buffer)?;
-            if bytes_read == 0 {
-                break;
-            }
-
-            let chunk = &buffer[..bytes_read];
-            let hash = self.store_chunk(chunk)?;
-
-            // Write chunk entry: key = blob_id + seq, value = hash
-            self.blobs.insert(entry_key(&id, seq), hash)?;
-            seq += 1;
-        }
-
-        // Write EOF marker: empty value
-        self.blobs.insert(entry_key(&id, seq), [])?;
-
-        Ok(id)
-    }
-
-    fn store_chunk(&self, data: &[u8]) -> fjall::Result<[u8; 32]> {
-        let hash: [u8; 32] = blake3::hash(data).into();
-
-        // Only write if not already present (content-addressed)
-        // TOCTOU race is fine: same hash means same content
-        if !self.cas.contains_key(hash)? {
-            self.cas.insert(hash, data)?;
-        }
-
-        Ok(hash)
-    }
-
-    fn get_blob_info(&self, id: &Scru128Id) -> fjall::Result<Option<BlobInfo>> {
-        let mut content_type = String::new();
-        let mut chunks = Vec::new();
-        let mut is_complete = false;
-        let mut seq = 0u32;
-        let prefix = id.to_bytes();
-
-        for item in self.blobs.prefix(Slice::from(prefix.as_slice())) {
-            let (_, value) = item.into_inner()?;
-
-            if seq == 0 {
-                // Content-type
-                content_type = String::from_utf8_lossy(&value).into_owned();
-            } else if value.is_empty() {
-                // EOF
-                is_complete = true;
-            } else if value.len() == 32 {
-                // Chunk hash
-                let hash: [u8; 32] = value.as_ref().try_into().unwrap();
-                chunks.push(hash);
-            }
-            seq += 1;
-        }
-
-        if seq == 0 {
-            return Ok(None); // Blob doesn't exist
-        }
-
-        Ok(Some(BlobInfo {
-            content_type,
-            chunks,
-            is_complete,
-        }))
-    }
-
-    fn get<W: Write>(&self, id: Scru128Id, mut writer: W) -> fjall::Result<Option<u64>> {
-        let Some(info) = self.get_blob_info(&id)? else {
-            return Ok(None);
-        };
-
-        let mut written = 0u64;
-        for hash in info.chunks {
-            let chunk = self.cas.get(hash)?.expect("missing chunk");
-            writer.write_all(&chunk)?;
-            written += chunk.len() as u64;
-        }
-
-        Ok(Some(written))
-    }
-
-    fn list(&self) -> fjall::Result<Vec<(Scru128Id, BlobStatus, String, usize, u64)>> {
-        let mut results = Vec::new();
-        let mut current_id: Option<Scru128Id> = None;
-        let mut content_type = String::new();
-        let mut chunk_count = 0usize;
-        let mut is_complete = false;
-        let mut size = 0u64;
-        let mut seq = 0u32;
-
-        for item in self.blobs.iter() {
-            let (key, value) = item.into_inner()?;
-            let id = Scru128Id::from_bytes(key[0..16].try_into().unwrap());
-
-            // New blob?
-            if current_id != Some(id) {
-                // Flush previous
-                if let Some(prev_id) = current_id {
-                    let status = if is_complete { BlobStatus::Complete } else { BlobStatus::Ingesting };
-                    results.push((prev_id, status, content_type.clone(), chunk_count, size));
-                }
-                current_id = Some(id);
-                content_type = String::new();
-                chunk_count = 0;
-                is_complete = false;
-                size = 0;
-                seq = 0;
-            }
-
-            if seq == 0 {
-                // Content-type
-                content_type = String::from_utf8_lossy(&value).into_owned();
-            } else if value.is_empty() {
-                is_complete = true;
-            } else if value.len() == 32 {
-                let hash: [u8; 32] = value.as_ref().try_into().unwrap();
-                if let Some(chunk) = self.cas.get(hash)? {
-                    size += chunk.len() as u64;
-                }
-                chunk_count += 1;
-            }
-            seq += 1;
-        }
-
-        // Flush last
-        if let Some(id) = current_id {
-            let status = if is_complete { BlobStatus::Complete } else { BlobStatus::Ingesting };
-            results.push((id, status, content_type, chunk_count, size));
-        }
-
-        Ok(results)
-    }
-
-    fn info(&self, id: Scru128Id) -> fjall::Result<Option<(BlobStatus, String, Vec<[u8; 32]>, u64)>> {
-        let Some(info) = self.get_blob_info(&id)? else {
-            return Ok(None);
-        };
-
-        let status = if info.is_complete { BlobStatus::Complete } else { BlobStatus::Ingesting };
-
-        let mut size = 0u64;
-        for hash in &info.chunks {
-            if let Some(chunk) = self.cas.get(hash)? {
-                size += chunk.len() as u64;
-            }
-        }
-
-        Ok(Some((status, info.content_type, info.chunks, size)))
+fn ratio(a: u64, b: u64) -> f64 {
+    if b > 0 {
+        a as f64 / b as f64
+    } else {
+        1.0
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("klump: {e:#}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
-    let store = Store::open(cli.store)?;
+    let store = Store::open(expand(&cli.store), cli.cache_mb)?;
 
-    match cli.command {
-        Commands::Put { content_type } => {
-            let stdin = std::io::stdin();
-            let id = store.put(&content_type, stdin.lock())?;
-            println!("{}", id);
-        }
-        Commands::Get { id } => {
-            let id: Scru128Id = id.parse().map_err(|_| "invalid scru128 id")?;
-            let stdout = std::io::stdout();
-            match store.get(id, stdout.lock())? {
-                Some(_) => {}
-                None => {
-                    eprintln!("blob not found: {}", id);
-                    std::process::exit(1);
+    match cli.cmd {
+        Cmd::Put { file, content_type, root, verbose, tee } => {
+            let ct = content_type.unwrap_or_else(|| DEFAULT_CONTENT_TYPE.into());
+            let started = Instant::now();
+            let sink = if tee { Some(io::stdout().lock()) } else { None };
+            let (id, trailer) = match file.as_deref() {
+                Some(p) if p.as_os_str() != "-" => {
+                    let f = std::fs::File::open(p)
+                        .with_context(|| format!("opening {}", p.display()))?;
+                    store.put_tee(&ct, io::BufReader::new(f), sink)?
                 }
+                _ => store.put_tee(&ct, io::stdin().lock(), sink)?,
+            };
+            let name = if root { trailer.root.clone() } else { id.to_string() };
+            // With --tee stdout carries the content, so the name goes to stderr.
+            if tee {
+                eprintln!("{name}");
+            } else {
+                println!("{name}");
             }
-        }
-        Commands::List => {
-            for (id, status, content_type, chunk_count, size) in store.list()? {
-                let ct = if content_type.is_empty() { "-" } else { &content_type };
-                println!(
-                    "{}\t{:?}\t{}\t{} chunks\t{} bytes",
-                    id, status, ct, chunk_count, size,
+            if verbose {
+                let secs = started.elapsed().as_secs_f64().max(1e-9);
+                eprintln!(
+                    "{} in {} chunks, {} at {}/s, root {}",
+                    human(trailer.size),
+                    trailer.chunks,
+                    store::since(started),
+                    human((trailer.size as f64 / secs) as u64),
+                    trailer.root
                 );
             }
         }
-        Commands::Info { id } => {
-            let id: Scru128Id = id.parse().map_err(|_| "invalid scru128 id")?;
-            match store.info(id)? {
-                Some((status, content_type, chunks, size)) => {
-                    println!("Status: {:?}", status);
-                    println!("Content-Type: {}", if content_type.is_empty() { "-" } else { &content_type });
-                    println!("Size: {} bytes", size);
-                    println!("Chunks: {}", chunks.len());
-                    for (i, hash) in chunks.iter().enumerate() {
-                        println!("  {}: {}", i, data_encoding::HEXLOWER.encode(hash));
-                    }
+
+        Cmd::Get { reference, output, follow } => {
+            let id = store.resolve(&parse_ref(&reference)?)?;
+            match output {
+                Some(p) => {
+                    let f = std::fs::File::create(&p)
+                        .with_context(|| format!("creating {}", p.display()))?;
+                    store.get(&id, io::BufWriter::new(f), follow)?;
                 }
                 None => {
-                    eprintln!("blob not found: {}", id);
-                    std::process::exit(1);
+                    let out = io::stdout();
+                    store.get(&id, io::BufWriter::new(out.lock()), follow)?;
                 }
+            }
+        }
+
+        Cmd::Ls { long } => {
+            for id in store.ids()? {
+                let Some(b) = store.load(&id)? else { continue };
+                let size = b.size().map(human).unwrap_or_else(|| "-".into());
+                if long {
+                    println!(
+                        "{id}  {size:>7}  {:<9}  {:<24}  {}",
+                        b.status(),
+                        b.content_type,
+                        b.trailer.as_ref().map(|t| t.root.as_str()).unwrap_or("-")
+                    );
+                } else {
+                    println!("{id}  {size:>7}  {:<9}  {}", b.status(), b.content_type);
+                }
+            }
+        }
+
+        Cmd::Info { reference, chunks } => {
+            let id = store.resolve(&parse_ref(&reference)?)?;
+            let b = store.load(&id)?.context("blob not found")?;
+            println!("id            {}", b.id);
+            println!("status        {}", b.status());
+            println!("content-type  {}", b.content_type);
+            match &b.trailer {
+                Some(t) => {
+                    println!("size          {} ({} bytes)", human(t.size), t.size);
+                    println!("chunks        {}", t.chunks);
+                    println!("root          {}", t.root);
+                    let holders = store.by_root(&ident::decode(&t.root)?)?;
+                    let others: Vec<String> = holders
+                        .iter()
+                        .filter(|h| **h != b.id)
+                        .map(|h| h.to_string())
+                        .collect();
+                    if !others.is_empty() {
+                        println!("also held by  {}", others.join(", "));
+                    }
+                }
+                None => println!("chunks        {} so far", b.chunks.len()),
+            }
+            if chunks {
+                println!();
+                for (i, h) in b.chunks.iter().enumerate() {
+                    println!("  {:>5}  {}", i + 1, ident::encode(h));
+                }
+            }
+        }
+
+        Cmd::Rm { references } => {
+            let mut chunks = 0;
+            let mut bytes = 0u64;
+            for r in &references {
+                let id = store.resolve(&parse_ref(r)?)?;
+                let (c, b) = store.remove(&id)?;
+                chunks += c;
+                bytes += b;
+                println!("removed {id}");
+            }
+            eprintln!("freed {chunks} chunks, {}", human(bytes));
+        }
+
+        Cmd::Verify { reference } => {
+            let id = store.resolve(&parse_ref(&reference)?)?;
+            let started = Instant::now();
+            let (ok, size) = store.verify(&id)?;
+            if !ok {
+                println!("FAILED  {id}");
+                std::process::exit(1);
+            }
+            println!("ok  {id}  {} in {}", human(size), store::since(started));
+        }
+
+        Cmd::Gc => {
+            let (n, bytes) = store.gc()?;
+            println!("removed {n} unreferenced chunks, {}", human(bytes));
+        }
+
+        Cmd::Stats => {
+            let s = store.stats()?;
+            println!("store          {}", store.path().display());
+            let ing = match s.ingesting {
+                0 => String::new(),
+                n => format!(" ({n} ingesting)"),
+            };
+            println!("blobs          {}{ing}", s.blobs);
+            println!("distinct roots {}", s.roots);
+            println!("chunks         {} unique, {} referenced", s.unique_chunks, s.chunk_refs);
+            let dedup = if s.chunk_refs > 0 {
+                100.0 * (s.chunk_refs - s.unique_chunks) as f64 / s.chunk_refs as f64
+            } else {
+                0.0
+            };
+            println!("dedup          {dedup:.1}%");
+            println!("logical        {:>7}  what the blobs contain", human(s.logical));
+            println!(
+                "stored         {:>7}  unique chunk bytes, {:.1}x from dedup",
+                human(s.stored),
+                ratio(s.logical, s.stored)
+            );
+            // On-disk covers the journal and anything compaction has not
+            // reclaimed yet, so it is not a compression ratio, and after a
+            // large delete it exceeds the live bytes until compaction runs.
+            if s.disk > s.stored {
+                println!(
+                    "on disk        {:>7}  includes journal and space pending compaction",
+                    human(s.disk)
+                );
+            } else {
+                println!(
+                    "on disk        {:>7}  {:.1}x smaller again after Lz4, {:.1}x overall",
+                    human(s.disk),
+                    ratio(s.stored, s.disk),
+                    ratio(s.logical, s.disk)
+                );
             }
         }
     }
 
+    let _ = io::stdout().flush();
     Ok(())
 }

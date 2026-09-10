@@ -1,13 +1,19 @@
 [package]
 name = "klump"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+description = "Streaming content-addressed blob store on fjall"
+license = "MIT"
 
 [dependencies]
-fjall = "3.0.1"
+anyhow = "1"
+blake3 = "1"
+clap = { version = "4", features = ["derive", "env"] }
+data-encoding = "2.6"
+fjall = { version = "=3.1.10", features = ["lz4"] }
 scru128 = { version = "3", features = ["serde"] }
-clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-blake3 = "1"
-data-encoding = "2.6"
+
+[profile.release]
+opt-level = 2
