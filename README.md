@@ -135,8 +135,8 @@ $ ffmpeg ... | klump put --tee -t video/mp4 2>id.txt | mpv -
 ```
 
 `get --follow` keeps reading while a blob is still being ingested and returns
-when its trailer lands. See the caveat in [Concurrency](#concurrency): today
-that is a library path, not a CLI one.
+when its trailer lands. That needs a daemon, because the store allows one
+process at a time; see [The daemon](#the-daemon).
 
 ## On disk
 
@@ -208,35 +208,140 @@ an absent key costs roughly 0.5% of a 64K insert, so it pays for itself above
 about 0.5% dedup, and a blind duplicate write would also burn space until blob
 GC reclaims it.
 
-## Concurrency
 
-fjall gives one process exclusive access to a store. There is no read-only or
-secondary mode: a second klump on the same directory gets
+## The daemon
+
+fjall gives one process exclusive access to a store, so a long-running klump
+would lock every other invocation out. `klump serve` holds the store and speaks
+HTTP over a unix socket; the CLI notices the socket and routes through it. Same
+commands, same output, either way.
+
+```console
+$ klump serve &
+klump serving ~/.klump on ~/.klump.sock
+
+$ klump put video.mp4 -t video/mp4    # goes over the socket now
+03guee76zwfg4u8rszu96hxfp
+```
+
+It speaks **HTTP/1.1 and HTTP/2 on the same socket**, chosen per connection by
+matching the first 24 bytes against HTTP/2's connection preface. Plain `curl`
+works, so does `curl --http2-prior-knowledge`, and neither needs an `Upgrade`
+dance.
 
 ```
-klump: store ~/.klump is locked by another klump process.
+POST   /blobs               stream an upload, reply is newline-delimited JSON
+GET    /blobs               list
+GET    /blobs/<ref>         stream content; ?follow keeps reading while it arrives
+GET    /blobs/<ref>?meta    metadata as JSON
+HEAD   /blobs/<ref>         metadata as headers
+DELETE /blobs/<ref>         unlink
+POST   /blobs/<ref>/verify  rehash and check against the root
+GET    /stats
+POST   /gc
 ```
 
-So `get --follow` cannot currently watch a blob that another `klump put` is
-writing. Following works inside one process, which is a library path today.
-Making it work across processes means a daemon owning the store, and that is
-not built.
+`<ref>` is a blob id, an unambiguous prefix of one, or a root hash.
 
-`rm` racing a `put` of the same chunk is the one unsafe interleaving: the
-remove can observe no refs and delete a chunk the ingest is about to reference.
-Single-process access makes this unreachable from the CLI today. A daemon would
-have to close it, with a transaction around the probe and the delete.
+### Why HTTP/2 earns its place
+
+On HTTP/1.1 a response cannot usefully begin until the request body finishes,
+so an upload only learns its id at the end. HTTP/2 frames request and response
+independently, so the id comes back straight away:
+
+```console
+$ slow-producer | curl --http2-prior-knowledge --unix-socket ~/.klump.sock \
+    -X POST -T - http://localhost/blobs
+  +   7ms  {"id":"03gued3ej4mpoy46e6gp53ffe"}    <- upload runs for another 3.2s
+  ...
+  {"chunks":8,"id":"...","root":"...","size":524288}
+```
+
+Seven milliseconds into a three second upload you have an id to hand a
+follower. That is the whole reason blobs are named before they exist.
+
+Flow control is per stream, so one slow reader is throttled on its own rather
+than stalling everything sharing the connection. Serving 60MB across three
+concurrent streams peaks at 24MB of memory.
+
+### Following
+
+```console
+$ klump get <id> --follow
+$ curl --unix-socket ~/.klump.sock "http://localhost/blobs/<id>?follow=1"
+```
+
+Returns when the blob's trailer lands. The writer and every reader are the same
+thread, so a follower is served in the same pass that stored the chunk rather
+than on a timer.
+
+### Deleting something in use
+
+`DELETE` follows the Unix file model rather than taking a lock. The name goes at
+once and the chunks survive while anyone still holds the blob open:
+
+```console
+$ klump rm <id>          # while a follower is mid-stream
+removed <id>
+freed 0 chunks, 0B       # deferred: someone still has it open
+```
+
+The follower reads to the end of what exists. A writer that was mid-upload
+keeps writing, exactly as it would to a deleted file, and its content is
+reclaimed when it closes. The race a lock would have guarded is unreachable,
+because reclamation only happens when nothing is mid-operation.
+
+## Architecture
+
+One thread, one loop, no async runtime.
+
+```
+polling          readiness: epoll, kqueue, or wepoll over IOCP on Windows
+h11r             sans-IO HTTP/1.1  receive_data / next_event / send_*
+shiguredo_http2  sans-IO HTTP/2    feed / process / poll_event / poll_output
+fjall            the store, blocking
+```
+
+Neither codec performs IO, so every syscall lives in one file and the loop reads
+as a `while`:
+
+```rust
+loop {
+    poller.wait(&mut events, timeout);
+    for c in ready {
+        c.feed(read(&mut buf));
+        while let Some(ev) = c.next() { route(ev) }
+    }
+    for c in all { pump(c); write_out(c) }
+}
+```
+
+Threads were the alternative and they lose here. HTTP/2 multiplexes many streams
+over one connection, which thread-per-connection has to demux by hand, and
+blocking on fjall would want `spawn_blocking` around every store call. The loop
+suits both, and it is why the Windows port is confined to which `UnixListener`
+gets imported.
+
+The cost is that fjall blocks, so a store call is head-of-line for every
+connection. A commit is about 53us in the common case, which does not bind. The
+tail is bimodal: once L0 backs up, `local_backpressure` deliberately slows the
+writer, first by spinning and then in 10ms sleeps, and a single loop shares that
+pause with everyone. `worker_threads` is the lever, since it sets how fast flush
+and compaction drain. `max_write_buffer_size` is not: fjall stores it and never
+reads it.
 
 ## Numbers
 
 On an 8-core Ryzen microVM, release build:
 
 ```
-ingest, 100 MB from a file      659 MB/s
-verify, 95 MB                   71ms
-BLAKE3 hash                     4163 MiB/s single-threaded
-Lz4 on tar / HTML / binaries    3.4x to 7.3x
-tar v1 vs v2, one member added  47.1% dedup, 6.8x overall
+ingest, 100 MB from a file           659 MB/s
+verify, 95 MB                        71ms
+BLAKE3 hash                          4163 MiB/s single-threaded
+Lz4 on tar / HTML / binaries         3.4x to 7.3x
+tar v1 vs v2, one member added       47.1% dedup, 6.8x overall
+id returned on a 3.2s HTTP/2 upload  7ms
+daemon RSS serving 60MB, 3 streams   24MB
 ```
 
 ## Not built
@@ -245,9 +350,10 @@ tar v1 vs v2, one member added  47.1% dedup, 6.8x overall
   a range mid-stream needs BLAKE3's interior tree nodes stored alongside, which
   [bao-tree](https://github.com/n0-computer/bao-tree) does. At a 64K block size,
   matching the chunk size, that outboard would cost 0.098% of content size.
-- No daemon, so no concurrent readers. See [Concurrency](#concurrency).
-- No library crate. klump is a binary; the store module is the shape a library
-  would take.
+- No library crate. klump is a binary; the store and client modules are the
+  shape a library would take.
+- No TLS and no TCP. The daemon listens on a unix socket only. rustls is
+  natively blocking, so adding it would not disturb the loop.
 - Fixed-size chunking, so dedup only survives changes that do not move bytes.
   Appending to a file keeps every chunk before the boundary. Inserting near the
   front shifts everything after it into new chunk boundaries and dedup goes to

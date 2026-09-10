@@ -713,6 +713,11 @@ fn route(conn: &mut Conn, sv: &mut Server, id: ReqId, method: &str, raw_path: &s
                             .collect();
                         v["also_held_by"] = serde_json::json!(holders);
                     }
+                    if query.contains_key("chunks") {
+                        let list: Vec<String> =
+                            blob.chunks.iter().map(crate::ident::encode).collect();
+                        v["chunk_hashes"] = serde_json::json!(list);
+                    }
                     let body = json(&v);
                     conn.reply(id, 200, "application/json", &body)?;
                 }

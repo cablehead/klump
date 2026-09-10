@@ -422,7 +422,12 @@ fn run_remote(cmd: Cmd, mut c: client::Client) -> Result<()> {
         }
 
         Cmd::Info { reference, chunks } => {
-            let v = c.json("GET", &format!("/blobs/{reference}?meta=1"))?;
+            let path = if chunks {
+                format!("/blobs/{reference}?meta=1&chunks=1")
+            } else {
+                format!("/blobs/{reference}?meta=1")
+            };
+            let v = c.json("GET", &path)?;
             println!("id            {}", v["id"].as_str().unwrap_or(""));
             println!("status        {}", v["status"].as_str().unwrap_or(""));
             println!("content-type  {}", v["content_type"].as_str().unwrap_or(""));
@@ -439,7 +444,10 @@ fn run_remote(cmd: Cmd, mut c: client::Client) -> Result<()> {
                 }
             }
             if chunks {
-                eprintln!("klump: --chunks needs direct store access; stop the daemon to use it");
+                println!();
+                for (i, h) in v["chunk_hashes"].as_array().cloned().unwrap_or_default().iter().enumerate() {
+                    println!("  {:>5}  {}", i + 1, h.as_str().unwrap_or(""));
+                }
             }
         }
 
