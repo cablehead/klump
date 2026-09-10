@@ -54,6 +54,16 @@ pub struct Trailer {
     pub root: String,
 }
 
+/// A blob being written. Holds the partial chunk, the running BLAKE3 of the
+/// content, and where we are in the sequence.
+pub struct Ingest {
+    pub id: Scru128Id,
+    hasher: blake3::Hasher,
+    pending: Vec<u8>,
+    seq: u32,
+    size: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct Blob {
     pub id: Scru128Id,
@@ -145,25 +155,12 @@ impl Store {
 
     // --- ingest ---------------------------------------------------------
 
-    /// Stream `reader` into a new blob, returning its id.
+    /// Open a blob and hand back its handle before any content exists.
     ///
-    /// Each chunk is committed in its own batch, so a reader following this
-    /// blob sees chunk n land before chunk n+1 is read. That is the point of
-    /// handing out the id up front, and it is why this is not one big batch.
-    #[allow(dead_code)] // library surface; the CLI always goes through put_tee
-    pub fn put<R: Read>(&self, content_type: &str, reader: R) -> Result<(Scru128Id, Trailer)> {
-        self.put_tee(content_type, reader, None::<std::io::Sink>)
-    }
-
-    /// As `put`, but also write every chunk onward as it is stored. One pass
-    /// over the bytes feeds the hasher, the store and the downstream reader,
-    /// so a pipeline can consume the content while it is being captured.
-    pub fn put_tee<R: Read, W: Write>(
-        &self,
-        content_type: &str,
-        mut reader: R,
-        mut tee: Option<W>,
-    ) -> Result<(Scru128Id, Trailer)> {
+    /// This is the whole point of the design: the id is knowable at open, the
+    /// root is not, so a subscriber can be told where to look while the bytes
+    /// are still arriving.
+    pub fn begin(&self, content_type: &str) -> Result<Ingest> {
         let id = scru128::new();
         let ct = if content_type.trim().is_empty() {
             DEFAULT_CONTENT_TYPE
@@ -171,66 +168,104 @@ impl Store {
             content_type
         };
         self.blobs.insert(entry_key(&id, 0), ct.as_bytes())?;
+        Ok(Ingest {
+            id,
+            hasher: blake3::Hasher::new(),
+            pending: Vec::with_capacity(CHUNK_SIZE),
+            seq: 1,
+            size: 0,
+        })
+    }
 
-        let mut hasher = blake3::Hasher::new();
-        let mut buf = vec![0u8; CHUNK_SIZE];
-        let mut seq: u32 = 1;
-        let mut size: u64 = 0;
-
-        loop {
-            // read_exact-like fill: a short read from a pipe is not EOF, and
-            // chunking on it would produce different chunk boundaries for the
-            // same bytes depending on how they arrived.
-            let mut filled = 0;
-            while filled < buf.len() {
-                match reader.read(&mut buf[filled..])? {
-                    0 => break,
-                    n => filled += n,
-                }
-            }
-            if filled == 0 {
-                break;
-            }
-            let chunk = &buf[..filled];
-            hasher.update(chunk);
-            size += filled as u64;
-            if let Some(w) = tee.as_mut() {
-                w.write_all(chunk)?;
-                w.flush()?;
-            }
-
-            let hash: Hash = blake3::hash(chunk).into();
-
-            // Check before write. The read costs about 0.5% of the write it
-            // may avoid, so it pays for itself above roughly that dedup rate,
-            // and a blind duplicate write would also burn space until blob GC
-            // reclaims it.
-            let mut batch = self.db.batch();
-            if !self.cas.contains_key(hash)? {
-                batch.insert(&self.cas, hash, chunk);
-            }
-            batch.insert(&self.blobs, entry_key(&id, seq), hash);
-            batch.insert(&self.refs, pair_key(&hash, &id), []);
-            batch.commit()?;
-
-            seq += 1;
-            if filled < CHUNK_SIZE {
-                break;
+    /// Take more bytes. Chunk boundaries are fixed offsets into the content,
+    /// never wherever a read happened to land, so the same bytes always chunk
+    /// the same way whether they arrived in one write or a thousand.
+    pub fn append(&self, ing: &mut Ingest, mut bytes: &[u8]) -> Result<()> {
+        while !bytes.is_empty() {
+            let want = CHUNK_SIZE - ing.pending.len();
+            let take = want.min(bytes.len());
+            ing.pending.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if ing.pending.len() == CHUNK_SIZE {
+                self.commit_chunk(ing)?;
             }
         }
+        Ok(())
+    }
 
-        let root: Hash = hasher.finalize().into();
-        let trailer = Trailer { size, chunks: seq - 1, root: ident::encode(&root) };
+    /// Seal the blob: flush any partial chunk, then write the trailer holding
+    /// what only EOF can tell you.
+    pub fn finish(&self, mut ing: Ingest) -> Result<Trailer> {
+        if !ing.pending.is_empty() {
+            self.commit_chunk(&mut ing)?;
+        }
+        let root: Hash = ing.hasher.finalize().into();
+        let trailer = Trailer {
+            size: ing.size,
+            chunks: ing.seq - 1,
+            root: ident::encode(&root),
+        };
+        let mut batch = self.db.batch();
+        batch.insert(
+            &self.blobs,
+            entry_key(&ing.id, TRAILER_SEQ),
+            serde_json::to_vec(&trailer)?,
+        );
+        batch.insert(&self.roots, pair_key(&root, &ing.id), []);
+        batch.commit()?;
+        Ok(trailer)
+    }
 
+    /// One chunk, one batch. Committing per chunk rather than per blob is what
+    /// lets a follower see chunk n land before chunk n+1 is even read.
+    fn commit_chunk(&self, ing: &mut Ingest) -> Result<()> {
+        let chunk = std::mem::replace(&mut ing.pending, Vec::with_capacity(CHUNK_SIZE));
+        ing.hasher.update(&chunk);
+        ing.size += chunk.len() as u64;
+        let hash: Hash = blake3::hash(&chunk).into();
+
+        // Check before write. The read costs about 0.5% of the write it may
+        // avoid, so it pays for itself above roughly that dedup rate, and a
+        // blind duplicate write would burn space until blob GC reclaims it.
+        let mut batch = self.db.batch();
+        if !self.cas.contains_key(hash)? {
+            batch.insert(&self.cas, hash, chunk);
+        }
+        batch.insert(&self.blobs, entry_key(&ing.id, ing.seq), hash);
+        batch.insert(&self.refs, pair_key(&hash, &ing.id), []);
+        batch.commit()?;
+        ing.seq += 1;
+        Ok(())
+    }
+
+    /// Stream a reader in, optionally forwarding each chunk onward as it is
+    /// stored so a pipeline captures and consumes in one pass.
+    pub fn put_tee<R: Read, W: Write>(
+        &self,
+        content_type: &str,
+        mut reader: R,
+        mut tee: Option<W>,
+    ) -> Result<(Scru128Id, Trailer)> {
+        let mut ing = self.begin(content_type)?;
+        let id = ing.id;
+        let mut buf = vec![0u8; CHUNK_SIZE];
+        loop {
+            let n = match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            };
+            if let Some(w) = tee.as_mut() {
+                w.write_all(&buf[..n])?;
+                w.flush()?;
+            }
+            self.append(&mut ing, &buf[..n])?;
+        }
         if let Some(mut w) = tee {
             w.flush()?;
         }
-
-        let mut batch = self.db.batch();
-        batch.insert(&self.blobs, entry_key(&id, TRAILER_SEQ), serde_json::to_vec(&trailer)?);
-        batch.insert(&self.roots, pair_key(&root, &id), []);
-        batch.commit()?;
-
+        let trailer = self.finish(ing)?;
         Ok((id, trailer))
     }
 
@@ -384,36 +419,8 @@ impl Store {
     /// harmless, so concurrent removes race benignly. A remove racing an
     /// ingest of the same chunk does not: see README, "Concurrency".
     pub fn remove(&self, id: &Scru128Id) -> Result<(usize, u64)> {
-        let blob = self.load(id)?.context("blob not found")?;
-
-        let mut distinct: Vec<Hash> = blob.chunks.clone();
-        distinct.sort_unstable();
-        distinct.dedup();
-
-        let mut batch = self.db.batch();
-        for item in self.blobs.prefix(id.to_bytes()) {
-            batch.remove(&self.blobs, item.key()?);
-        }
-        for hash in &distinct {
-            batch.remove(&self.refs, pair_key(hash, id));
-        }
-        if let Some(t) = &blob.trailer {
-            batch.remove(&self.roots, pair_key(&ident::decode(&t.root)?, id));
-        }
-        batch.commit()?;
-
-        let mut freed_chunks = 0;
-        let mut freed_bytes = 0u64;
-        for hash in &distinct {
-            if self.refs.prefix(hash).next().is_none() {
-                if let Some(g) = self.cas.get(hash)? {
-                    freed_bytes += g.len() as u64;
-                }
-                self.cas.remove(hash)?;
-                freed_chunks += 1;
-            }
-        }
-        Ok((freed_chunks, freed_bytes))
+        let hashes = self.unlink(id)?;
+        self.reclaim(&hashes)
     }
 
     /// Sweep chunks nothing references. `remove` already reclaims as it goes,
@@ -526,5 +533,75 @@ pub fn since(t: Instant) -> String {
         format!("{:.0}ms", s * 1000.0)
     } else {
         format!("{s:.1}s")
+    }
+}
+
+impl Store {
+    /// Remove a blob from the namespace without reclaiming its chunks.
+    ///
+    /// The Unix model: unlink drops the name, and the content survives while
+    /// anyone still holds it open. Returns the chunks the blob referenced so
+    /// the caller can reclaim them once the last handle closes.
+    pub fn unlink(&self, id: &Scru128Id) -> Result<Vec<Hash>> {
+        let blob = self.load(id)?.context("blob not found")?;
+        let mut distinct = blob.chunks.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+
+        let mut batch = self.db.batch();
+        for item in self.blobs.prefix(id.to_bytes()) {
+            batch.remove(&self.blobs, item.key()?);
+        }
+        for hash in &distinct {
+            batch.remove(&self.refs, pair_key(hash, id));
+        }
+        if let Some(t) = &blob.trailer {
+            batch.remove(&self.roots, pair_key(&ident::decode(&t.root)?, id));
+        }
+        batch.commit()?;
+        Ok(distinct)
+    }
+
+    /// Drop any of these chunks that nothing references any more.
+    pub fn reclaim(&self, hashes: &[Hash]) -> Result<(usize, u64)> {
+        let mut n = 0;
+        let mut bytes = 0u64;
+        for hash in hashes {
+            if self.refs.prefix(hash).next().is_none() {
+                if let Some(v) = self.cas.get(hash)? {
+                    bytes += v.len() as u64;
+                }
+                self.cas.remove(hash)?;
+                n += 1;
+            }
+        }
+        Ok((n, bytes))
+    }
+
+    /// Chunk hashes from `from` onward, without rescanning the whole blob.
+    /// A follower calls this every time it wakes, so it must cost what
+    /// arrived rather than what exists.
+    pub fn chunks_from(&self, id: &Scru128Id, from: u32) -> Result<(Vec<Hash>, bool)> {
+        let mut start = id.to_bytes().to_vec();
+        start.extend_from_slice(&from.to_be_bytes());
+        let mut end = id.to_bytes().to_vec();
+        end.extend_from_slice(&u32::MAX.to_be_bytes());
+
+        let mut out = Vec::new();
+        let mut complete = false;
+        for item in self.blobs.range(start..=end) {
+            let (k, v) = item.into_inner()?;
+            let seq = u32::from_be_bytes(k[16..20].try_into().unwrap());
+            if seq == TRAILER_SEQ {
+                complete = true;
+            } else if v.len() == 32 {
+                out.push(<Hash>::try_from(v.as_ref()).unwrap());
+            }
+        }
+        Ok((out, complete))
+    }
+
+    pub fn chunk(&self, hash: &Hash) -> Result<Option<Vec<u8>>> {
+        Ok(self.cas.get(hash)?.map(|v| v.to_vec()))
     }
 }

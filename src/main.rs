@@ -1,10 +1,11 @@
 //! klump: streaming content-addressed blob storage on fjall.
 
+mod client;
 mod ident;
 mod serve;
 mod store;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use ident::{human, parse_ref};
 use std::io::{self, Write};
@@ -31,9 +32,12 @@ struct Cli {
     /// Store directory
     #[arg(long, env = "KLUMP_STORE", default_value = "~/.klump", global = true)]
     store: String,
-    /// Block cache, in MiB
+    /// Block cache, in MiB. Ignored when a daemon is serving.
     #[arg(long, env = "KLUMP_CACHE_MB", default_value_t = 64, global = true)]
     cache_mb: u64,
+    /// Daemon socket. Used automatically when something is listening on it.
+    #[arg(long, env = "KLUMP_SOCKET", default_value = "~/.klump.sock", global = true)]
+    socket: String,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -96,11 +100,7 @@ enum Cmd {
     /// Summarise the store
     Stats,
     /// Run the daemon
-    Serve {
-        /// Unix socket to listen on
-        #[arg(long, env = "KLUMP_SOCKET", default_value = "~/.klump.sock")]
-        socket: String,
-    },
+    Serve {},
 }
 
 fn expand(p: &str) -> PathBuf {
@@ -129,9 +129,23 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    let socket = expand(&cli.socket);
+
+    // serve always takes the store itself; everything else prefers a daemon
+    // if one is holding it, because fjall allows only one process at a time.
+    if !matches!(cli.cmd, Cmd::Serve { }) {
+        if let Some(c) = client::Client::connect(&socket) {
+            return run_remote(cli.cmd, c);
+        }
+    }
+
     let store = Store::open(expand(&cli.store), cli.cache_mb)?;
+    if let Cmd::Serve { } = cli.cmd {
+        return serve::serve(store, &socket);
+    }
 
     match cli.cmd {
+        Cmd::Serve { } => unreachable!(),
         Cmd::Put { file, content_type, root, verbose, tee } => {
             let ct = content_type.unwrap_or_else(|| DEFAULT_CONTENT_TYPE.into());
             let started = Instant::now();
@@ -251,10 +265,6 @@ fn run() -> Result<()> {
             println!("ok  {id}  {} in {}", human(size), store::since(started));
         }
 
-        Cmd::Serve { socket } => {
-            serve::serve(store, &expand(&socket))?;
-        }
-
         Cmd::Gc => {
             let (n, bytes) = store.gc()?;
             println!("removed {n} unreferenced chunks, {}", human(bytes));
@@ -302,5 +312,211 @@ fn run() -> Result<()> {
     }
 
     let _ = io::stdout().flush();
+    Ok(())
+}
+
+/// The same commands, against a running daemon.
+///
+/// The store allows one process at a time, so a daemon holding it would make
+/// every other klump invocation fail. Instead the CLI notices the socket and
+/// speaks to it. Nothing about the command surface changes.
+fn run_remote(cmd: Cmd, mut c: client::Client) -> Result<()> {
+    match cmd {
+        Cmd::Serve { .. } => unreachable!("serve is always local"),
+
+        Cmd::Put { file, content_type, root, verbose, tee } => {
+            let ct = content_type.unwrap_or_else(|| DEFAULT_CONTENT_TYPE.into());
+            let started = Instant::now();
+            let mut stdout = io::stdout();
+            let mut sink: Option<&mut dyn Write> = if tee { Some(&mut stdout) } else { None };
+            let mut f;
+            let mut stdin;
+            let body: &mut dyn io::Read = match file.as_deref() {
+                Some(p) if p.as_os_str() != "-" => {
+                    f = io::BufReader::new(
+                        std::fs::File::open(p)
+                            .with_context(|| format!("opening {}", p.display()))?,
+                    );
+                    &mut f
+                }
+                _ => {
+                    stdin = io::stdin().lock();
+                    &mut stdin
+                }
+            };
+            let reply = c.send("POST", "/blobs", Some(&ct), Some(body), sink.take())?;
+            let mut out = Vec::new();
+            c.read_body(&mut out)?;
+            if reply.status >= 400 {
+                bail!("{}", String::from_utf8_lossy(&out).trim());
+            }
+            // NDJSON: the id landed first, the trailer closes it.
+            let last = out
+                .split(|b| *b == b'\n')
+                .filter(|l| !l.is_empty())
+                .next_back()
+                .unwrap_or_default();
+            let v: serde_json::Value = serde_json::from_slice(last)?;
+            let id = v["id"].as_str().unwrap_or_default();
+            let rt = v["root"].as_str().unwrap_or_default();
+            let name = if root { rt } else { id };
+            if tee {
+                eprintln!("{name}");
+            } else {
+                println!("{name}");
+            }
+            if verbose {
+                let size = v["size"].as_u64().unwrap_or(0);
+                let secs = started.elapsed().as_secs_f64().max(1e-9);
+                eprintln!(
+                    "{} in {} chunks, {} at {}/s, root {rt}",
+                    human(size),
+                    v["chunks"].as_u64().unwrap_or(0),
+                    store::since(started),
+                    human((size as f64 / secs) as u64),
+                );
+            }
+        }
+
+        Cmd::Get { reference, output, follow } => {
+            let path = if follow {
+                format!("/blobs/{reference}?follow=1")
+            } else {
+                format!("/blobs/{reference}")
+            };
+            let reply = c.send("GET", &path, None, None, None)?;
+            if reply.status >= 400 {
+                let mut e = Vec::new();
+                c.read_body(&mut e)?;
+                bail!("{}", String::from_utf8_lossy(&e).trim());
+            }
+            match output {
+                Some(p) => {
+                    let f = std::fs::File::create(&p)
+                        .with_context(|| format!("creating {}", p.display()))?;
+                    c.read_body(&mut io::BufWriter::new(f))?;
+                }
+                None => {
+                    let out = io::stdout();
+                    c.read_body(&mut io::BufWriter::new(out.lock()))?;
+                }
+            }
+        }
+
+        Cmd::Ls { long } => {
+            let v = c.json("GET", "/blobs")?;
+            for b in v.as_array().cloned().unwrap_or_default() {
+                let size = b["size"].as_u64().map(human).unwrap_or_else(|| "-".into());
+                let status = b["status"].as_str().unwrap_or("?");
+                let ct = b["content_type"].as_str().unwrap_or("");
+                let id = b["id"].as_str().unwrap_or("");
+                if long {
+                    println!(
+                        "{id}  {size:>7}  {status:<9}  {ct:<24}  {}",
+                        b["root"].as_str().unwrap_or("-")
+                    );
+                } else {
+                    println!("{id}  {size:>7}  {status:<9}  {ct}");
+                }
+            }
+        }
+
+        Cmd::Info { reference, chunks } => {
+            let v = c.json("GET", &format!("/blobs/{reference}?meta=1"))?;
+            println!("id            {}", v["id"].as_str().unwrap_or(""));
+            println!("status        {}", v["status"].as_str().unwrap_or(""));
+            println!("content-type  {}", v["content_type"].as_str().unwrap_or(""));
+            if let Some(size) = v["size"].as_u64() {
+                println!("size          {} ({size} bytes)", human(size));
+                println!("chunks        {}", v["chunks"].as_u64().unwrap_or(0));
+                println!("root          {}", v["root"].as_str().unwrap_or(""));
+                let held: Vec<String> = v["also_held_by"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                if !held.is_empty() {
+                    println!("also held by  {}", held.join(", "));
+                }
+            }
+            if chunks {
+                eprintln!("klump: --chunks needs direct store access; stop the daemon to use it");
+            }
+        }
+
+        Cmd::Rm { references } => {
+            let mut n = 0u64;
+            let mut bytes = 0u64;
+            for r in &references {
+                let v = c.json("DELETE", &format!("/blobs/{r}"))?;
+                println!("removed {}", v["id"].as_str().unwrap_or(r));
+                n += v["freed_chunks"].as_u64().unwrap_or(0);
+                bytes += v["freed_bytes"].as_u64().unwrap_or(0);
+            }
+            eprintln!("freed {n} chunks, {}", human(bytes));
+        }
+
+        Cmd::Verify { reference } => {
+            let started = Instant::now();
+            let v = c.json("POST", &format!("/blobs/{reference}/verify"))?;
+            let id = v["id"].as_str().unwrap_or(&reference);
+            if v["ok"].as_bool().unwrap_or(false) {
+                println!(
+                    "ok  {id}  {} in {}",
+                    human(v["size"].as_u64().unwrap_or(0)),
+                    store::since(started)
+                );
+            } else {
+                println!("FAILED  {id}");
+                std::process::exit(1);
+            }
+        }
+
+        Cmd::Gc => {
+            let v = c.json("POST", "/gc")?;
+            println!(
+                "removed {} unreferenced chunks, {}",
+                v["chunks"].as_u64().unwrap_or(0),
+                human(v["bytes"].as_u64().unwrap_or(0))
+            );
+        }
+
+        Cmd::Stats => {
+            let v = c.json("GET", "/stats")?;
+            let g = |k: &str| v[k].as_u64().unwrap_or(0);
+            let ing = match g("ingesting") {
+                0 => String::new(),
+                n => format!(" ({n} ingesting)"),
+            };
+            println!("blobs          {}{ing}", g("blobs"));
+            println!("distinct roots {}", g("roots"));
+            println!(
+                "chunks         {} unique, {} referenced",
+                g("unique_chunks"),
+                g("chunk_refs")
+            );
+            let (u, r) = (g("unique_chunks"), g("chunk_refs"));
+            let dedup = if r > 0 { 100.0 * (r - u) as f64 / r as f64 } else { 0.0 };
+            println!("dedup          {dedup:.1}%");
+            println!("logical        {:>7}  what the blobs contain", human(g("logical")));
+            println!(
+                "stored         {:>7}  unique chunk bytes, {:.1}x from dedup",
+                human(g("stored")),
+                ratio(g("logical"), g("stored"))
+            );
+            if g("disk") > g("stored") {
+                println!(
+                    "on disk        {:>7}  includes journal and space pending compaction",
+                    human(g("disk"))
+                );
+            } else {
+                println!(
+                    "on disk        {:>7}  {:.1}x smaller again after Lz4, {:.1}x overall",
+                    human(g("disk")),
+                    ratio(g("stored"), g("disk")),
+                    ratio(g("logical"), g("disk"))
+                );
+            }
+        }
+    }
     Ok(())
 }

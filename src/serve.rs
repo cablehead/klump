@@ -28,6 +28,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use win_uds::net::{UnixListener, UnixStream};
 
 use crate::store::Store;
+use scru128::Scru128Id;
 
 const LISTENER_KEY: usize = 0;
 
@@ -42,7 +43,7 @@ enum ReqId {
 /// What a codec told us happened, lifted out of the codec's borrow so we can
 /// turn round and write to it.
 enum Incoming {
-    Request { id: ReqId, method: String, path: String },
+    Request { id: ReqId, method: String, path: String, ctype: String },
     Body { id: ReqId, data: Vec<u8>, end: bool },
     End(ReqId),
     Closed,
@@ -59,16 +60,36 @@ enum Codec {
     H2(Box<shiguredo_http2::Connection>),
 }
 
+/// Everything in flight on one connection. HTTP/1.1 keys on 0 because it has
+/// one request at a time; HTTP/2 keys on the stream id.
+enum Req {
+    Ingest(crate::store::Ingest),
+}
+
+pub struct Server {
+    store: Store,
+    handles: Handles,
+}
+
 struct Conn {
     sock: UnixStream,
     codec: Codec,
     out: Vec<u8>,
     dead: bool,
+    reqs: HashMap<u32, Req>,
+    outs: Vec<Out>,
 }
 
 impl Conn {
     fn new(sock: UnixStream) -> Self {
-        Self { sock, codec: Codec::Sniffing(Vec::new()), out: Vec::new(), dead: false }
+        Self {
+            sock,
+            codec: Codec::Sniffing(Vec::new()),
+            out: Vec::new(),
+            dead: false,
+            reqs: HashMap::new(),
+            outs: Vec::new(),
+        }
     }
 
     /// Decide the protocol once there is enough evidence, then replay the
@@ -129,7 +150,7 @@ impl Conn {
             Codec::H1(c) => {
                 let ev = match c.next_event() {
                     Ok(NextEvent::Event(e)) => e,
-                    Ok(NextEvent::NeedData) | Ok(NextEvent::Paused) => return Ok(Incoming::Idle),| Ok(NextEvent::Paused) => return Ok(Incoming::Ignored),
+                    Ok(NextEvent::NeedData) | Ok(NextEvent::Paused) => return Ok(Incoming::Idle),
                     Err(e) => return Err(anyhow::anyhow!("h1: {e:?}")),
                 };
                 Ok(match ev {
@@ -137,6 +158,12 @@ impl Conn {
                         id: ReqId::H1,
                         method: String::from_utf8_lossy(r.method.as_bytes()).into_owned(),
                         path: String::from_utf8_lossy(&r.target).into_owned(),
+                        ctype: r
+                            .headers
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case(b"content-type"))
+                            .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
+                            .unwrap_or_default(),
                     },
                     H1Event::Data(d) => Incoming::Body {
                         id: ReqId::H1,
@@ -159,15 +186,13 @@ impl Conn {
                                 .map(|h| String::from_utf8_lossy(h.value()).into_owned())
                                 .unwrap_or_default()
                         };
-                        let req = Incoming::Request {
+                        let _ = end_stream;
+                        Incoming::Request {
                             id: ReqId::H2(stream_id),
                             method: get(":method"),
                             path: get(":path"),
-                        };
-                        if end_stream {
-                            // the loop will see End on the next poll
+                            ctype: get("content-type"),
                         }
-                        req
                     }
                     H2Event::DataReceived { stream_id, data, end_stream, .. } => Incoming::Body {
                         id: ReqId::H2(stream_id),
@@ -181,42 +206,6 @@ impl Conn {
                     _ => Incoming::Ignored,
                 })
             }
-        }
-    }
-
-    /// A complete small response: head, body, end. The two codecs differ only
-    /// in whether they hand back bytes or buffer them.
-    fn respond(&mut self, id: ReqId, status: u16, ctype: &str, body: &[u8]) -> Result<()> {
-        match (&mut self.codec, id) {
-            (Codec::H1(c), _) => {
-                let resp = H1Response {
-                    status: StatusCode::try_from(status).map_err(|e| anyhow::anyhow!("{e:?}"))?,
-                    reason: Vec::new(),
-                    headers: vec![
-                        (b"content-type".to_vec(), ctype.as_bytes().to_vec()),
-                        (b"content-length".to_vec(), body.len().to_string().into_bytes()),
-                    ],
-                    http_version: Version::Http11,
-                };
-                let mut bytes = c.send_response(&resp).map_err(|e| anyhow::anyhow!("{e:?}"))?;
-                bytes.extend(c.send_data(body).map_err(|e| anyhow::anyhow!("{e:?}"))?);
-                bytes.extend(c.end_of_message(&[]).map_err(|e| anyhow::anyhow!("{e:?}"))?);
-                self.out.extend_from_slice(&bytes);
-                Ok(())
-            }
-            (Codec::H2(c), ReqId::H2(sid)) => {
-                c.send_response(
-                    sid,
-                    vec![
-                        HeaderField::new(":status", &status.to_string())?,
-                        HeaderField::new("content-type", ctype)?,
-                    ],
-                    false,
-                )?;
-                c.send_data(sid, body.to_vec(), true)?;
-                Ok(())
-            }
-            _ => Ok(()),
         }
     }
 
@@ -256,16 +245,10 @@ impl Conn {
         !self.out.is_empty() || matches!(&self.codec, Codec::H2(c) if c.has_output())
     }
 
-    fn proto(&self) -> &'static str {
-        match self.codec {
-            Codec::Sniffing(_) => "?",
-            Codec::H1(_) => "HTTP/1.1",
-            Codec::H2(_) => "HTTP/2",
-        }
-    }
 }
 
 pub fn serve(store: Store, socket: &Path) -> Result<()> {
+    let mut sv = Server { store, handles: Handles::default() };
     if let Some(dir) = socket.parent() {
         std::fs::create_dir_all(dir).ok();
     }
@@ -284,11 +267,14 @@ pub fn serve(store: Store, socket: &Path) -> Result<()> {
     let mut buf = vec![0u8; 64 * 1024];
     let mut next_key = 1usize;
 
-    eprintln!("klump serving {} on {}", store.path().display(), socket.display());
+    eprintln!("klump serving {} on {}", sv.store.path().display(), socket.display());
 
     loop {
         events.clear();
-        poller.wait(&mut events, Some(Duration::from_millis(500)))?;
+        // The timeout is only a backstop. A follower is normally served in the
+        // same pass that stored the chunk, because the writer and the readers
+        // are the same thread.
+        poller.wait(&mut events, Some(Duration::from_millis(200)))?;
 
         for ev in events.iter() {
             if ev.key == LISTENER_KEY {
@@ -314,9 +300,7 @@ pub fn serve(store: Store, socket: &Path) -> Result<()> {
                 }
                 continue;
             }
-
             let Some(conn) = conns.get_mut(&ev.key) else { continue };
-
             if ev.readable {
                 match conn.read_in(&mut buf) {
                     Ok(true) => {}
@@ -327,30 +311,52 @@ pub fn serve(store: Store, socket: &Path) -> Result<()> {
                     }
                 }
             }
-
             if !conn.dead {
-                if let Err(e) = drain(conn, &store) {
+                if let Err(e) = drain(conn, &mut sv) {
                     eprintln!("klump: conn {}: {e:#}", ev.key);
                     conn.dead = true;
                 }
             }
+        }
+
+        // Every connection, every pass. A blob written on one connection has
+        // followers on others, and they are owed the chunk now rather than at
+        // the next timeout.
+        let mut reap = Vec::new();
+        for (key, conn) in conns.iter_mut() {
             if !conn.dead {
-                if let Err(e) = conn.write_out() {
-                    eprintln!("klump: conn {}: {e:#}", ev.key);
+                if let Err(e) = pump(conn, &mut sv) {
+                    eprintln!("klump: conn {key}: {e:#}");
                     conn.dead = true;
                 }
             }
-
+            if let Err(e) = conn.write_out() {
+                eprintln!("klump: conn {key}: {e:#}");
+                conn.dead = true;
+            }
             if conn.dead && conn.out.is_empty() {
-                let conn = conns.remove(&ev.key).expect("present");
-                let _ = poller.delete(&conn.sock);
+                reap.push(*key);
             } else {
                 let interest = if conn.wants_write() {
-                    PollEvent::all(ev.key)
+                    PollEvent::all(*key)
                 } else {
-                    PollEvent::readable(ev.key)
+                    PollEvent::readable(*key)
                 };
                 poller.modify_with_mode(&conn.sock, interest, PollMode::Level)?;
+            }
+        }
+        for key in reap {
+            if let Some(conn) = conns.remove(&key) {
+                // Anything this connection still held open is now closed, so a
+                // blob unlinked while it was reading can finally be reclaimed.
+                for out in &conn.outs {
+                    sv.handles.close(&sv.store, out.id);
+                }
+                for req in conn.reqs.values() {
+                    let Req::Ingest(ing) = req;
+                    sv.handles.close(&sv.store, ing.id);
+                }
+                let _ = poller.delete(&conn.sock);
             }
         }
     }
@@ -369,9 +375,8 @@ fn maybe_cycle(conn: &mut Conn) {
     }
 }
 
-/// Pull every event the codec has and act on it. Milestone: echo the request
-/// line back as JSON, over whichever protocol the client chose.
-fn drain(conn: &mut Conn, _store: &Store) -> Result<()> {
+/// Pull every event the codec has and act on it.
+fn drain(conn: &mut Conn, sv: &mut Server) -> Result<()> {
     loop {
         match conn.next()? {
             Incoming::Idle => return Ok(()),
@@ -380,18 +385,379 @@ fn drain(conn: &mut Conn, _store: &Store) -> Result<()> {
                 conn.dead = true;
                 return Ok(());
             }
-            Incoming::Request { id, method, path } => {
-                let body = format!(
-                    "{{\"proto\":\"{}\",\"method\":\"{}\",\"path\":\"{}\"}}\n",
-                    conn.proto(),
-                    method,
-                    path
-                );
-                conn.respond(id, 200, "application/json", body.as_bytes())?;
+            Incoming::Request { id, method, path, ctype } => {
+                route(conn, sv, id, &method, &path, ctype)?;
+            }
+            Incoming::Body { id, data, end } => {
+                if let Some(Req::Ingest(ing)) = conn.reqs.get_mut(&Conn::key(id)) {
+                    sv.store.append(ing, &data)?;
+                }
+                if end {
+                    finish_ingest(conn, sv, id)?;
+                }
+            }
+            Incoming::End(id) => {
+                finish_ingest(conn, sv, id)?;
                 maybe_cycle(conn);
             }
-            Incoming::Body { .. } => {}
-            Incoming::End(_) => maybe_cycle(conn),| Incoming::End(_) => {}
         }
     }
+}
+
+/// Seal an upload and send the trailer as the last line of the response.
+///
+/// The body is newline-delimited JSON: the id went out the moment the blob
+/// was opened, and this closes with what only EOF could tell us.
+fn finish_ingest(conn: &mut Conn, sv: &mut Server, id: ReqId) -> Result<()> {
+    let Some(Req::Ingest(ing)) = conn.reqs.remove(&Conn::key(id)) else {
+        return Ok(());
+    };
+    let bid = ing.id;
+    let trailer = sv.store.finish(ing)?;
+    sv.handles.close(&sv.store, bid);
+    let body = json(&serde_json::json!({
+        "id": bid.to_string(),
+        "size": trailer.size,
+        "chunks": trailer.chunks,
+        "root": trailer.root,
+    }));
+    conn.body(id, &body, true)?;
+    maybe_cycle(conn);
+    Ok(())
+}
+
+// --- request handling ---------------------------------------------------
+
+/// Open handles, and blobs whose name is gone but whose content is still
+/// being read or written.
+///
+/// This is the Unix file model. `DELETE` unlinks: the blob leaves the
+/// namespace at once, and its chunks survive while anyone holds it open.
+/// Because the daemon is the only thing touching the store and the loop is
+/// single threaded, this count is authoritative and needs no locking.
+#[derive(Default)]
+pub struct Handles {
+    open: HashMap<Scru128Id, usize>,
+    pending: HashMap<Scru128Id, Vec<[u8; 32]>>,
+}
+
+impl Handles {
+    fn open(&mut self, id: Scru128Id) {
+        *self.open.entry(id).or_insert(0) += 1;
+    }
+
+    /// Drop a handle, reclaiming the blob's chunks if it was unlinked while
+    /// we held it and we were the last one out.
+    fn close(&mut self, store: &Store, id: Scru128Id) {
+        if let Some(n) = self.open.get_mut(&id) {
+            *n -= 1;
+            if *n == 0 {
+                self.open.remove(&id);
+                if let Some(mut hashes) = self.pending.remove(&id) {
+                    // A writer holding an unlinked blob keeps writing, exactly
+                    // as it would to a deleted file. Those later chunks gave it
+                    // a name again, so take that back before reclaiming.
+                    if let Ok(more) = store.unlink(&id) {
+                        hashes.extend(more);
+                    }
+                    hashes.sort_unstable();
+                    hashes.dedup();
+                    let _ = store.reclaim(&hashes);
+                }
+            }
+        }
+    }
+
+    fn is_open(&self, id: &Scru128Id) -> bool {
+        self.open.contains_key(id)
+    }
+}
+
+/// A response still being written out. The loop pumps these every pass, so a
+/// follower sees a chunk in the same iteration that stored it.
+struct Out {
+    req: ReqId,
+    id: Scru128Id,
+    next: u32,
+    follow: bool,
+}
+
+fn json(v: &serde_json::Value) -> Vec<u8> {
+    let mut s = serde_json::to_vec(v).unwrap_or_default();
+    s.push(b'\n');
+    s
+}
+
+fn split_path(path: &str) -> (String, HashMap<String, String>) {
+    let (p, q) = path.split_once('?').unwrap_or((path, ""));
+    let query = q
+        .split('&')
+        .filter(|s| !s.is_empty())
+        .map(|kv| {
+            let (k, v) = kv.split_once('=').unwrap_or((kv, "1"));
+            (k.to_string(), v.to_string())
+        })
+        .collect();
+    (p.to_string(), query)
+}
+
+impl Conn {
+    fn key(id: ReqId) -> u32 {
+        match id {
+            ReqId::H1 => 0,
+            ReqId::H2(s) => s.as_u32(),
+        }
+    }
+
+    /// Response head only. `len` fixes Content-Length; None means the length
+    /// is not known yet, which on HTTP/1.1 has to be chunked.
+    fn head(&mut self, id: ReqId, status: u16, extra: Vec<(String, String)>, len: Option<u64>) -> Result<()> {
+        match (&mut self.codec, id) {
+            (Codec::H1(c), _) => {
+                let mut headers: Vec<(Vec<u8>, Vec<u8>)> = extra
+                    .iter()
+                    .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
+                    .collect();
+                match len {
+                    Some(n) => headers
+                        .push((b"content-length".to_vec(), n.to_string().into_bytes())),
+                    None => headers
+                        .push((b"transfer-encoding".to_vec(), b"chunked".to_vec())),
+                }
+                let resp = H1Response {
+                    status: StatusCode::try_from(status).map_err(|e| anyhow::anyhow!("{e:?}"))?,
+                    reason: Vec::new(),
+                    headers,
+                    http_version: Version::Http11,
+                };
+                let bytes = c.send_response(&resp).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                self.out.extend_from_slice(&bytes);
+            }
+            (Codec::H2(c), ReqId::H2(sid)) => {
+                let mut headers = vec![HeaderField::new(":status", &status.to_string())?];
+                for (k, v) in &extra {
+                    headers.push(HeaderField::new(k, v)?);
+                }
+                if let Some(n) = len {
+                    headers.push(HeaderField::new("content-length", &n.to_string())?);
+                }
+                c.send_response(sid, headers, false)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn body(&mut self, id: ReqId, data: &[u8], end: bool) -> Result<()> {
+        match (&mut self.codec, id) {
+            (Codec::H1(c), _) => {
+                if !data.is_empty() {
+                    let b = c.send_data(data).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                    self.out.extend_from_slice(&b);
+                }
+                if end {
+                    let b = c.end_of_message(&[]).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                    self.out.extend_from_slice(&b);
+                }
+            }
+            (Codec::H2(c), ReqId::H2(sid)) => {
+                if !data.is_empty() || end {
+                    c.send_data(sid, data.to_vec(), end)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn reply(&mut self, id: ReqId, status: u16, ctype: &str, body: &[u8]) -> Result<()> {
+        self.head(
+            id,
+            status,
+            vec![("content-type".into(), ctype.into())],
+            Some(body.len() as u64),
+        )?;
+        self.body(id, body, true)?;
+        maybe_cycle(self);
+        Ok(())
+    }
+
+    fn fail(&mut self, id: ReqId, status: u16, msg: &str) -> Result<()> {
+        let b = json(&serde_json::json!({ "error": msg }));
+        self.reply(id, status, "application/json", &b)
+    }
+}
+
+fn blob_json(b: &crate::store::Blob) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "id": b.id.to_string(),
+        "content_type": b.content_type,
+        "status": b.status(),
+    });
+    if let Some(t) = &b.trailer {
+        v["size"] = serde_json::json!(t.size);
+        v["chunks"] = serde_json::json!(t.chunks);
+        v["root"] = serde_json::json!(t.root);
+    }
+    v
+}
+
+/// Route one request. Bodies arrive later as `Incoming::Body`, so anything
+/// that consumes one only sets up state here.
+fn route(conn: &mut Conn, sv: &mut Server, id: ReqId, method: &str, raw_path: &str, ctype: String) -> Result<()> {
+    let (path, query) = split_path(raw_path);
+    let key = Conn::key(id);
+
+    let resolve = |sv: &Server, s: &str| -> Option<Scru128Id> {
+        crate::ident::parse_ref(s).ok().and_then(|r| sv.store.resolve(&r).ok())
+    };
+
+    match (method, path.as_str()) {
+        ("POST", "/blobs") => {
+            let ing = sv.store.begin(&ctype)?;
+            let bid = ing.id;
+            sv.handles.open(bid);
+            conn.reqs.insert(key, Req::Ingest(ing));
+            // The id exists now, so hand it over now. On HTTP/2 this reaches
+            // the client while it is still sending, which is the whole point.
+            let body = json(&serde_json::json!({ "id": bid.to_string() }));
+            conn.head(id, 202, vec![("content-type".into(), "application/json".into())], None)?;
+            conn.body(id, &body, false)?;
+        }
+
+        ("GET", "/blobs") => {
+            let mut arr = Vec::new();
+            for bid in sv.store.ids()? {
+                if let Some(b) = sv.store.load(&bid)? {
+                    arr.push(blob_json(&b));
+                }
+            }
+            let body = json(&serde_json::Value::Array(arr));
+            conn.reply(id, 200, "application/json", &body)?;
+        }
+
+        ("GET", "/stats") => {
+            let s = sv.store.stats()?;
+            let body = json(&serde_json::json!({
+                "blobs": s.blobs, "ingesting": s.ingesting, "roots": s.roots,
+                "unique_chunks": s.unique_chunks, "chunk_refs": s.chunk_refs,
+                "logical": s.logical, "stored": s.stored, "disk": s.disk,
+            }));
+            conn.reply(id, 200, "application/json", &body)?;
+        }
+
+        ("POST", "/gc") => {
+            let (n, bytes) = sv.store.gc()?;
+            let body = json(&serde_json::json!({ "chunks": n, "bytes": bytes }));
+            conn.reply(id, 200, "application/json", &body)?;
+        }
+
+        (m, p) if p.starts_with("/blobs/") => {
+            let rest = &p["/blobs/".len()..];
+            let (r, action) = rest.split_once('/').unwrap_or((rest, ""));
+            let Some(bid) = resolve(sv, r) else {
+                return conn.fail(id, 404, "no such blob");
+            };
+            let Some(blob) = sv.store.load(&bid)? else {
+                return conn.fail(id, 404, "no such blob");
+            };
+            match (m, action) {
+                ("POST", "verify") => {
+                    let (ok, size) = sv.store.verify(&bid)?;
+                    let body = json(&serde_json::json!({
+                        "id": bid.to_string(), "ok": ok, "size": size,
+                    }));
+                    conn.reply(id, if ok { 200 } else { 409 }, "application/json", &body)?;
+                }
+                ("GET", _) if query.contains_key("meta") => {
+                    let mut v = blob_json(&blob);
+                    if let Some(t) = &blob.trailer {
+                        let holders: Vec<String> = sv
+                            .store
+                            .by_root(&crate::ident::decode(&t.root)?)?
+                            .iter()
+                            .filter(|h| **h != bid)
+                            .map(|h| h.to_string())
+                            .collect();
+                        v["also_held_by"] = serde_json::json!(holders);
+                    }
+                    let body = json(&v);
+                    conn.reply(id, 200, "application/json", &body)?;
+                }
+                ("HEAD", _) => {
+                    let mut extra = vec![("content-type".into(), blob.content_type.clone())];
+                    if let Some(t) = &blob.trailer {
+                        extra.push(("klump-root".into(), t.root.clone()));
+                        extra.push(("klump-chunks".into(), t.chunks.to_string()));
+                    }
+                    extra.push(("klump-id".into(), blob.id.to_string()));
+                    extra.push(("klump-status".into(), blob.status().into()));
+                    conn.head(id, 200, extra, Some(blob.size().unwrap_or(0)))?;
+                    conn.body(id, &[], true)?;
+                    maybe_cycle(conn);
+                }
+                ("GET", _) => {
+                    let follow = query.contains_key("follow");
+                    let len = if follow { None } else { blob.size() };
+                    sv.handles.open(bid);
+                    let mut extra = vec![("content-type".into(), blob.content_type.clone())];
+                    if let Some(t) = &blob.trailer {
+                        extra.push(("klump-root".into(), t.root.clone()));
+                    }
+                    conn.head(id, 200, extra, len)?;
+                    conn.outs.push(Out { req: id, id: bid, next: 1, follow });
+                }
+                ("DELETE", _) => {
+                    let hashes = sv.store.unlink(&bid)?;
+                    let (n, bytes) = if sv.handles.is_open(&bid) {
+                        // Someone still holds it. Reclaim when they let go.
+                        sv.handles.pending.insert(bid, hashes);
+                        (0, 0)
+                    } else {
+                        sv.store.reclaim(&hashes)?
+                    };
+                    let body = json(&serde_json::json!({
+                        "id": bid.to_string(), "freed_chunks": n, "freed_bytes": bytes,
+                    }));
+                    conn.reply(id, 200, "application/json", &body)?;
+                }
+                _ => return conn.fail(id, 405, "method not allowed"),
+            }
+        }
+
+        _ => return conn.fail(id, 404, "no such route"),
+    }
+    Ok(())
+}
+
+/// Push whatever has arrived for each in-flight read. Called every pass, so
+/// a follower is served in the same iteration that committed the chunk.
+fn pump(conn: &mut Conn, sv: &mut Server) -> Result<()> {
+    let mut finished = Vec::new();
+    for i in 0..conn.outs.len() {
+        let (req, bid, from, follow) = {
+            let o = &conn.outs[i];
+            (o.req, o.id, o.next, o.follow)
+        };
+        let (hashes, complete) = sv.store.chunks_from(&bid, from)?;
+        for h in &hashes {
+            let Some(chunk) = sv.store.chunk(h)? else { continue };
+            conn.body(req, &chunk, false)?;
+        }
+        conn.outs[i].next += hashes.len() as u32;
+        // A blob unlinked mid-read stops growing; end at what we have.
+        let gone = sv.store.load(&bid)?.is_none();
+        if complete || gone || !follow {
+            conn.body(req, &[], true)?;
+            finished.push((i, bid, req));
+        }
+    }
+    for (i, bid, _) in finished.iter().rev() {
+        conn.outs.remove(*i);
+        sv.handles.close(&sv.store, *bid);
+    }
+    if !finished.is_empty() {
+        maybe_cycle(conn);
+    }
+    Ok(())
 }
