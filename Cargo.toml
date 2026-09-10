@@ -11,9 +11,15 @@ blake3 = "1"
 clap = { version = "4", features = ["derive", "env"] }
 data-encoding = "2.6"
 fjall = { version = "=3.1.10", features = ["lz4"] }
+h11r = "0.2.1"
+polling = "3.11.0"
 scru128 = { version = "3", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+shiguredo_http2 = "2026.1.0-canary.15"
 
 [profile.release]
 opt-level = 2
+
+[target."cfg(windows)".dependencies]
+win_uds = "0.2.4"

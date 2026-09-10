@@ -1,6 +1,7 @@
 //! klump: streaming content-addressed blob storage on fjall.
 
 mod ident;
+mod serve;
 mod store;
 
 use anyhow::{Context, Result};
@@ -94,6 +95,12 @@ enum Cmd {
     Gc,
     /// Summarise the store
     Stats,
+    /// Run the daemon
+    Serve {
+        /// Unix socket to listen on
+        #[arg(long, env = "KLUMP_SOCKET", default_value = "~/.klump.sock")]
+        socket: String,
+    },
 }
 
 fn expand(p: &str) -> PathBuf {
@@ -242,6 +249,10 @@ fn run() -> Result<()> {
                 std::process::exit(1);
             }
             println!("ok  {id}  {} in {}", human(size), store::since(started));
+        }
+
+        Cmd::Serve { socket } => {
+            serve::serve(store, &expand(&socket))?;
         }
 
         Cmd::Gc => {
